@@ -77,7 +77,9 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
 
     await update_progress(55, f"Загружено {len(pages_html)} страниц")
 
-    # Принудительно загружаем ключевые legal-страницы, если их ещё нет
+    # Принудительно загружаем ключевые legal-страницы, если их ещё нет.
+    # Также вытаскиваем legal-ссылки на любые домены (cross-domain политики -
+    # для сайтов часто используют policies.google.com, legal.acme.ru и т.п.).
     LEGAL_HINTS = [
         "/polic", "/privac", "/personal", "/конфиденциал", "/персональн", "/pdn",
         "/offer", "/оферт", "/договор", "/соглашен", "/terms", "/agreement",
@@ -86,16 +88,46 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
         "/доставк", "/delivery", "/оплат", "/payment", "/возврат", "/return", "/refund",
     ]
     LEGAL_EXCLUDE = ["dashboard", "advisor", "settings", "account", "myactivity", "controls"]
-    extra_urls = []
+
+    # Вытаскиваем все ссылки на legal со всех загруженных страниц (включая cross-domain)
+    from bs4 import BeautifulSoup as _BS
+    cross_domain_legal = []
+    seen_extra = set(pages_html.keys())
+    for src_html in list(pages_html.values()):
+        try:
+            soup = _BS(src_html, "lxml")
+        except Exception:
+            continue
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            full = href if href.startswith(("http://", "https://")) else None
+            if not full:
+                continue
+            low = full.lower()
+            if any(ex in low for ex in LEGAL_EXCLUDE):
+                continue
+            if any(h in low for h in LEGAL_HINTS) and full not in seen_extra:
+                seen_extra.add(full)
+                cross_domain_legal.append(full)
+            if len(cross_domain_legal) >= 6:
+                break
+        if len(cross_domain_legal) >= 6:
+            break
+
+    # Same-domain legal ссылки из links
+    extra_urls = list(cross_domain_legal)
     for link in links:
         low = link.lower()
-        if link in pages_html:
+        if link in pages_html or link in seen_extra:
             continue
         if any(ex in low for ex in LEGAL_EXCLUDE):
             continue
         if any(h in low for h in LEGAL_HINTS):
+            seen_extra.add(link)
             extra_urls.append(link)
-        if len(extra_urls) >= 6:
+        if len(extra_urls) >= 8:
             break
     if extra_urls:
         extra_results = await asyncio.gather(*(fetch_page(u, TIMEOUT) for u in extra_urls), return_exceptions=True)
