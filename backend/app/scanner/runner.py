@@ -6,6 +6,7 @@ from app.scanner.checks import (
     fetch_sitemap_links,
     extract_all_internal_links,
     detect_site_type,
+    detect_language,
     SITE_TYPE_LABELS,
     check_https_detailed,
     check_privacy_policy,
@@ -76,9 +77,16 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
 
     await update_progress(55, f"Загружено {len(pages_html)} страниц")
 
-    # Определяем тип сайта по содержимому
+    # Определяем тип сайта и язык
     site_type, site_type_signals = detect_site_type(pages_html)
     site_type_label = SITE_TYPE_LABELS.get(site_type, site_type)
+    language = detect_language(pages_html)
+
+    # Если сайт не на русском и домен не .ru/.рф — это явно не для пользователей РФ
+    from urllib.parse import urlparse as _urlparse
+    domain = _urlparse(final_url).netloc.lower()
+    is_ru_domain = domain.endswith(".ru") or domain.endswith(".рф") or domain.endswith(".xn--p1ai")
+    is_russian_audience = (language == "ru") or is_ru_domain
 
     # robots.txt + sitemap.xml
     robots_ok, sitemap_ok = await check_robots_sitemap(final_url)
@@ -86,55 +94,116 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
     all_checks = []
     all_issues = []
 
+    # 0. Сводка: язык / аудитория
+    if not is_russian_audience:
+        all_checks.append({
+            "code": "audience",
+            "title": "Целевая аудитория",
+            "status": "warning",
+            "details": (
+                f"Сайт не на русском языке (язык: {language}) и домен не .ru/.рф. "
+                "Требования российского законодательства (152-ФЗ, ЗоЗПП и др.) могут быть нерелевантны, "
+                "если сайт не предназначен для российской аудитории. Проверки выполнены справочно."
+            ),
+            "evidence": [f"Домен: {domain}", f"Язык контента: {language}"],
+        })
+    else:
+        all_checks.append({
+            "code": "audience",
+            "title": "Целевая аудитория",
+            "status": "passed",
+            "details": (
+                f"Сайт ориентирован на российскую аудиторию (язык: {language}, домен: {domain}). "
+                "Применяются требования российского законодательства."
+            ),
+            "evidence": [f"Домен: {domain}", f"Язык контента: {language}"],
+        })
+
     # 1. HTTPS
     https_check, https_issues = await check_https_detailed(final_url)
     all_checks.append(https_check); all_issues.extend(https_issues)
     await update_progress(60, "Проверка HTTPS")
 
+    # Хелпер для нерусских сайтов: пропускаем чисто российские проверки
+    def _na_check(code: str, title: str) -> dict:
+        return {
+            "code": code, "title": title,
+            "status": "passed",
+            "details": "Не применимо: сайт не для российской аудитории",
+            "evidence": [],
+        }
+
     # 2. 152-ФЗ — политика обработки ПДн
-    pp_check, pp_issues = check_privacy_policy(pages_html, links)
-    all_checks.append(pp_check); all_issues.extend(pp_issues)
+    if is_russian_audience:
+        pp_check, pp_issues = check_privacy_policy(pages_html, links)
+        all_checks.append(pp_check); all_issues.extend(pp_issues)
+    else:
+        all_checks.append(_na_check("privacy_policy", "152-ФЗ — Политика обработки персональных данных"))
     await update_progress(65, "Проверка политики обработки ПДн")
 
-    # 3. 152-ФЗ — согласие в формах
+    # 3. 152-ФЗ — согласие в формах (актуально для любых форм с ПДн)
     fc_check, fc_issues = check_form_consent(pages_html)
-    all_checks.append(fc_check); all_issues.extend(fc_issues)
+    all_checks.append(fc_check)
+    if is_russian_audience:
+        all_issues.extend(fc_issues)
     await update_progress(70, "Проверка форм сбора данных")
 
     # 4. 152-ФЗ — локализация серверов
-    loc_check, loc_issues = await check_server_location(final_url)
-    all_checks.append(loc_check); all_issues.extend(loc_issues)
+    if is_russian_audience:
+        loc_check, loc_issues = await check_server_location(final_url)
+        all_checks.append(loc_check); all_issues.extend(loc_issues)
+    else:
+        all_checks.append(_na_check("server_location", "152-ФЗ — Локализация серверов (ст. 18.5)"))
     await update_progress(75, "Проверка локализации серверов")
 
     # 5. 152-ФЗ — уведомление РКН
-    rkn_check, rkn_issues = check_rkn_notification(pages_html)
-    all_checks.append(rkn_check); all_issues.extend(rkn_issues)
+    if is_russian_audience:
+        rkn_check, rkn_issues = check_rkn_notification(pages_html)
+        all_checks.append(rkn_check); all_issues.extend(rkn_issues)
+    else:
+        all_checks.append(_na_check("rkn_notification", "152-ФЗ — Уведомление Роскомнадзора (ст. 22)"))
 
-    # 6. Cookie-баннер
+    # 6. Cookie-баннер (актуально везде, но штрафы только для RU)
     cb_check, cb_issues = check_cookie_banner(pages_html)
-    all_checks.append(cb_check); all_issues.extend(cb_issues)
+    all_checks.append(cb_check)
+    if is_russian_audience:
+        all_issues.extend(cb_issues)
     await update_progress(80, "Проверка cookie-баннера")
 
     # 7. 38-ФЗ — маркировка рекламы
-    ad_check, ad_issues = check_advertising_marking(pages_html)
-    all_checks.append(ad_check); all_issues.extend(ad_issues)
+    if is_russian_audience:
+        ad_check, ad_issues = check_advertising_marking(pages_html)
+        all_checks.append(ad_check); all_issues.extend(ad_issues)
+    else:
+        all_checks.append(_na_check("advertising_marking", "38-ФЗ — Маркировка рекламы (ERID)"))
 
     # 8. 149-ФЗ — реквизиты
-    req_check, req_issues = check_company_requisites(pages_html)
-    all_checks.append(req_check); all_issues.extend(req_issues)
+    if is_russian_audience:
+        req_check, req_issues = check_company_requisites(pages_html)
+        all_checks.append(req_check); all_issues.extend(req_issues)
+    else:
+        all_checks.append(_na_check("company_requisites", "149-ФЗ — Реквизиты компании"))
     await update_progress(85, "Проверка реквизитов компании")
 
     # 9. ЗоЗПП — документы для потребителей (зависит от типа сайта)
-    cr_check, cr_issues = check_consumer_rights(pages_html, links, site_type)
-    all_checks.append(cr_check); all_issues.extend(cr_issues)
+    if is_russian_audience:
+        cr_check, cr_issues = check_consumer_rights(pages_html, links, site_type)
+        all_checks.append(cr_check); all_issues.extend(cr_issues)
+    else:
+        all_checks.append(_na_check("consumer_rights", "ЗоЗПП — Документы для потребителей"))
 
     # 10. 436-ФЗ — возрастная маркировка
-    age_check, age_issues = check_age_marking(pages_html)
-    all_checks.append(age_check); all_issues.extend(age_issues)
+    if is_russian_audience:
+        age_check, age_issues = check_age_marking(pages_html)
+        all_checks.append(age_check); all_issues.extend(age_issues)
+    else:
+        all_checks.append(_na_check("age_marking", "436-ФЗ — Возрастная маркировка"))
 
     # 11. Контакты
     contacts_check, contacts_issues = check_contacts(pages_html)
-    all_checks.append(contacts_check); all_issues.extend(contacts_issues)
+    all_checks.append(contacts_check)
+    if is_russian_audience:
+        all_issues.extend(contacts_issues)
 
     # 12. Безопасность платежей
     pay_check, pay_issues = check_payment_security(pages_html)
@@ -163,6 +232,9 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
 
     meta = {
         "final_url": final_url,
+        "domain": domain,
+        "language": language,
+        "is_russian_audience": is_russian_audience,
         "site_type": site_type,
         "site_type_label": site_type_label,
         "site_type_signals": site_type_signals,

@@ -731,27 +731,43 @@ def check_cookie_banner(pages_html: dict) -> Tuple[dict, list]:
 # ============================================================================
 
 ERID_PATTERN = re.compile(r"erid\s*[:=]?\s*[a-zA-Z0-9]{8,}", re.IGNORECASE)
-AD_LABEL_PATTERN = re.compile(r"\bреклама\b|\bна правах рекламы\b|\badvertisement\b", re.IGNORECASE)
+# «На правах рекламы» — однозначный маркер интернет-рекламы (38-ФЗ)
+AD_LABEL_STRONG = re.compile(r"на правах рекламы|реклама\s*\.|sponsored\s*post|promoted by", re.IGNORECASE)
+# Метка «реклама» в характерных рекламных блоках (data-ad, ad-banner и т.п.)
+AD_BLOCK_PATTERN = re.compile(
+    r"data-ad-|class=[\"'][^\"']*\b(ad|advert|banner|promo)[a-z\-]*\b|"
+    r"id=[\"'][^\"']*\b(ad|advert|banner|promo)[a-z\-]*\b",
+    re.IGNORECASE,
+)
+ADVERTISER_KW = [
+    "рекламодатель", "сведения о рекламодателе", "идентификатор рекламы",
+    "advertiser", "ad ID",
+]
 
 
 def check_advertising_marking(pages_html: dict) -> Tuple[dict, list]:
-    has_ads = False
+    has_strong_ad = False
     has_erid = False
+    has_advertiser = False
     evidence = []
 
     for url, html in pages_html.items():
-        if AD_LABEL_PATTERN.search(html):
-            has_ads = True
-            evidence.append(f"Метка «Реклама» найдена на {url}")
+        m = AD_LABEL_STRONG.search(html)
+        if m:
+            has_strong_ad = True
+            evidence.append(f"Маркер рекламы «{m.group(0)}» на {url}")
         if ERID_PATTERN.search(html):
             has_erid = True
             evidence.append(f"Токен ERID найден на {url}")
+        text_lower = html.lower()
+        if any(kw in text_lower for kw in ADVERTISER_KW):
+            has_advertiser = True
 
-    if not has_ads:
+    if not has_strong_ad and not has_erid:
         return {
             "code": "advertising_marking", "title": "38-ФЗ — Маркировка рекламы (ERID)",
             "status": "passed",
-            "details": "Рекламные блоки на сайте не обнаружены",
+            "details": "Явные рекламные блоки на сайте не обнаружены",
             "evidence": [],
         }, []
 
@@ -759,20 +775,21 @@ def check_advertising_marking(pages_html: dict) -> Tuple[dict, list]:
         return {
             "code": "advertising_marking", "title": "38-ФЗ — Маркировка рекламы (ERID)",
             "status": "passed",
-            "details": "На сайте есть реклама и она промаркирована ERID-токеном",
+            "details": "На сайте найдены ERID-токены — реклама промаркирована",
             "evidence": evidence,
         }, []
 
+    # Есть маркер рекламы, но нет ERID
     return {
         "code": "advertising_marking", "title": "38-ФЗ — Маркировка рекламы (ERID)",
         "status": "failed",
-        "details": "На сайте есть реклама, но ERID-токен не найден",
+        "details": "Найдены метки рекламы, но ERID-токены не обнаружены",
         "evidence": evidence,
     }, [{
         "code": "missing_erid", "title": "Реклама без ERID-токена",
         "severity": "high", "category": "ads",
         "description": (
-            "На сайте обнаружены метки «Реклама», но ERID-токен не найден. "
+            "На сайте обнаружены метки «На правах рекламы», но ERID-токен не найден. "
             "Согласно ст. 18.1 ФЗ «О рекламе» (38-ФЗ), вся интернет-реклама с 1 сентября 2022 года должна "
             "содержать ERID-токен и сведения о рекламодателе."
         ),
@@ -901,84 +918,108 @@ def check_company_requisites(pages_html: dict) -> Tuple[dict, list]:
 
 
 # ============================================================================
-# Определение типа сайта
+# Определение типа сайта и языка
 # ============================================================================
 
+def detect_language(pages_html: dict) -> str:
+    """Возвращает 'ru' или 'other' по соотношению кириллицы к латинице."""
+    text = _all_text(pages_html)
+    if not text:
+        return "other"
+    cyr = sum(1 for ch in text if "\u0400" <= ch <= "\u04FF")
+    lat = sum(1 for ch in text if "a" <= ch <= "z")
+    if cyr == 0 and lat == 0:
+        return "other"
+    return "ru" if cyr / max(cyr + lat, 1) >= 0.25 else "other"
+
+
+# Признаки требуют чёткого совпадения с границами слов
 ECOMMERCE_KW = [
-    "корзина", "в корзину", "добавить в корзину", "купить", "оформить заказ",
-    "checkout", "cart", "basket", "add to cart", "buy now", "shop",
-    "мой заказ", "ваш заказ", "товары в корзине",
+    r"\bкорзин[аеуы]\b", r"\bв корзину\b", r"\bдобавить в корзину\b",
+    r"\bоформить заказ\b", r"\bкупить\b", r"\bзаказать\b",
+    r"\bcheckout\b", r"\bshopping cart\b", r"\bbasket\b",
+    r"\badd to cart\b", r"\bbuy now\b",
+    r"\bтоваров? в корзин[еу]\b", r"\bваш заказ\b",
 ]
-ECOMMERCE_PRICE_PATTERN = re.compile(r"\d[\d\s]{1,8}\s*(?:₽|руб\.?|rub\b|р\.)", re.IGNORECASE)
+
+ECOMMERCE_PRICE_PATTERN = re.compile(r"\d[\d\s]{1,8}\s*(?:₽|руб\.?|р\.)", re.IGNORECASE)
 
 SERVICE_KW = [
-    "тариф", "тарифы", "подписка", "подписк", "оформить подписку",
-    "личный кабинет", "мой профиль", "subscription", "pricing", "plans",
-    "оплатить тариф", "продлить подписку",
+    r"\bтариф[ыа-я]*\b", r"\bподписк[аеиу]\b", r"\bоформить подписку\b",
+    r"\bличный кабинет\b", r"\bмой профиль\b", r"\bоплатить тариф\b",
+    r"\bпродлить подписку\b",
+    r"\bsubscription\b", r"\bpricing\b", r"\bplans\b",
 ]
 
 CORPORATE_KW = [
-    "наши услуги", "услуги компании", "оставить заявку", "заказать звонок",
-    "обратная связь", "консультация", "наши проекты", "портфолио",
-    "о нас", "о компании", "наши клиенты", "сертификаты",
+    r"\bнаши услуги\b", r"\bуслуги компании\b", r"\bоставить заявку\b",
+    r"\bзаказать звонок\b", r"\bобратная связь\b", r"\bконсультаци[ия]\b",
+    r"\bнаши проекты\b", r"\bпортфолио\b", r"\bо нас\b", r"\bо компании\b",
+    r"\bсертификат[ыов]?\b",
 ]
 
 INFO_KW = [
-    "статьи", "новости", "блог", "публикации", "архив",
-    "категории", "теги", "автор", "комментариев",
+    r"\bстатьи\b", r"\bновости\b", r"\bблог\b", r"\bпубликаци[ий]\b",
+    r"\bкомментари[ийя]+\b", r"\bкатегори[ия]\b", r"\bтег[иов]?\b",
 ]
+
+
+def _count_matches(patterns: List[str], text: str) -> Tuple[int, List[str]]:
+    matched = []
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            matched.append(m.group(0))
+    return len(matched), matched
 
 
 def detect_site_type(pages_html: dict) -> Tuple[str, List[str]]:
     """
     Возвращает тип сайта: 'ecommerce' | 'service' | 'corporate' | 'informational'
-    и список признаков, по которым тип был определён.
+    и список признаков.
     """
     all_text = _all_text(pages_html)
     all_html_text = _all_html(pages_html)
-
     signals = []
 
-    # E-commerce
-    ecommerce_hits = [kw for kw in ECOMMERCE_KW if kw in all_text]
+    ecom_score, ecom_matches = _count_matches(ECOMMERCE_KW, all_text)
     price_count = len(ECOMMERCE_PRICE_PATTERN.findall(all_html_text))
-    has_product_og = "og:type" in all_html_text and "product" in all_html_text
-    ecommerce_score = len(ecommerce_hits) + (2 if price_count >= 5 else 0) + (3 if has_product_og else 0)
+    has_product_og = re.search(r'og:type[^>]*content=["\']product["\']', all_html_text) is not None
+    if price_count >= 5:
+        ecom_score += 2
+    if has_product_og:
+        ecom_score += 3
 
-    # Service / SaaS
-    service_hits = [kw for kw in SERVICE_KW if kw in all_text]
-    service_score = len(service_hits)
-
-    # Corporate / услуги
-    corporate_hits = [kw for kw in CORPORATE_KW if kw in all_text]
-    corporate_score = len(corporate_hits)
-
-    # Informational
-    info_hits = [kw for kw in INFO_KW if kw in all_text]
+    service_score, service_matches = _count_matches(SERVICE_KW, all_text)
+    corp_score, corp_matches = _count_matches(CORPORATE_KW, all_text)
+    info_score, info_matches = _count_matches(INFO_KW, all_text)
     article_tags = sum(html.lower().count("<article") for html in pages_html.values())
-    info_score = len(info_hits) + (3 if article_tags >= 5 else (1 if article_tags >= 2 else 0))
+    if article_tags >= 5:
+        info_score += 3
+    elif article_tags >= 2:
+        info_score += 1
 
-    if ecommerce_score >= 3:
-        if ecommerce_hits:
-            signals.append(f"e-commerce признаки: {', '.join(ecommerce_hits[:3])}")
+    # E-commerce требует минимум 3 явных совпадения ИЛИ 2 + цены/og:product
+    if ecom_score >= 3 and (len(ecom_matches) >= 2 or has_product_og):
+        signals.append(f"e-commerce: {', '.join(ecom_matches[:4])}")
         if price_count >= 5:
-            signals.append(f"найдено {price_count} цен")
+            signals.append(f"найдено {price_count} цен в рублях")
         return "ecommerce", signals
 
-    if service_score >= 2 and service_score > ecommerce_score:
-        signals.append(f"сервис/SaaS: {', '.join(service_hits[:3])}")
+    if service_score >= 2 and service_score >= corp_score:
+        signals.append(f"сервис/SaaS: {', '.join(service_matches[:3])}")
         return "service", signals
 
-    if info_score >= 4 and info_score > corporate_score:
+    if info_score >= 4 and info_score > corp_score:
         signals.append(f"информационный: {info_score} признаков, {article_tags} тегов <article>")
         return "informational", signals
 
-    if corporate_score >= 2:
-        signals.append(f"корпоративный/услуги: {', '.join(corporate_hits[:3])}")
+    if corp_score >= 2:
+        signals.append(f"корпоративный/услуги: {', '.join(corp_matches[:3])}")
         return "corporate", signals
 
     if info_score >= 2:
-        signals.append(f"информационный: {', '.join(info_hits[:3])}")
+        signals.append(f"информационный: {', '.join(info_matches[:3])}")
         return "informational", signals
 
     return "corporate", ["тип не определён, используются мягкие правила"]
@@ -1139,9 +1180,17 @@ def check_consumer_rights(pages_html: dict, links: List[str], site_type: str) ->
 # ============================================================================
 
 AGE_MARK_PATTERN = re.compile(r"\b(?:0\+|6\+|12\+|16\+|18\+)\b")
-ADULT_KW = [
-    "казино", "ставк", "букмекер", "алкогол", "табак", "вейп", "сигарет",
-    "эротик", "порно", "18+", "взрослый контент", "только для взрослых",
+ADULT_KW_PATTERNS = [
+    re.compile(r"\bказино\b", re.IGNORECASE),
+    re.compile(r"\bставк[аеиу]\b", re.IGNORECASE),
+    re.compile(r"\bбукмекер[ская]*\b", re.IGNORECASE),
+    re.compile(r"\bалкогол[ьяи]+\b", re.IGNORECASE),
+    re.compile(r"\bводк[аеи]\b", re.IGNORECASE),
+    re.compile(r"\bпив[оаунзе]+\b", re.IGNORECASE),
+    re.compile(r"\bвин[оаеу]\b", re.IGNORECASE),
+    re.compile(r"\bтабак\b|\bсигарет[ыы]+\b|\bвейп[ыов]?\b", re.IGNORECASE),
+    re.compile(r"\bпорно\b|\bэротик[аеи]\b", re.IGNORECASE),
+    re.compile(r"\bвзрослый контент\b|\bтолько для взрослых\b", re.IGNORECASE),
 ]
 
 
@@ -1149,7 +1198,7 @@ def check_age_marking(pages_html: dict) -> Tuple[dict, list]:
     all_text = _all_text(pages_html)
     all_html = _all_html(pages_html)
 
-    has_adult = any(kw in all_text for kw in ADULT_KW)
+    has_adult = any(p.search(all_text) for p in ADULT_KW_PATTERNS)
     age_marks = set(AGE_MARK_PATTERN.findall(all_html))
 
     if age_marks:
