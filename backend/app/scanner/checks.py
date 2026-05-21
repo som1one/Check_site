@@ -333,20 +333,31 @@ PRIVACY_SECTION_KW = {
 
 
 def check_privacy_policy(pages_html: dict, links: List[str]) -> Tuple[dict, list]:
-    all_text = _all_text(pages_html)
+    policy_url = _find_link_by_keywords(pages_html, links, PRIVACY_PAGE_KW)
 
-    found_sections = {name: any(kw in all_text for kw in kws) for name, kws in PRIVACY_SECTION_KW.items()}
+    # Если политика — отдельная страница, проверяем содержимое именно её,
+    # иначе ищем по всем загруженным страницам.
+    if policy_url and policy_url in pages_html:
+        text_to_check = ""
+        soup = BeautifulSoup(pages_html[policy_url], "lxml")
+        text_to_check = soup.get_text(" ", strip=True).lower()
+        scope_label = "на странице политики"
+    else:
+        text_to_check = _all_text(pages_html)
+        scope_label = "на сайте"
+
+    found_sections = {name: any(kw in text_to_check for kw in kws) for name, kws in PRIVACY_SECTION_KW.items()}
     sections_found = sum(found_sections.values())
     total = len(PRIVACY_SECTION_KW)
     missing_sections = [name for name, ok in found_sections.items() if not ok]
 
-    policy_url = _find_link_by_keywords(pages_html, links, PRIVACY_PAGE_KW)
-
     evidence = []
     if policy_url:
         evidence.append(f"Страница политики: {policy_url}")
+        if policy_url not in pages_html:
+            evidence.append("Содержимое страницы не было загружено — проверяли весь сайт")
     for name, ok in found_sections.items():
-        evidence.append(f"Раздел «{name}»: " + ("найден" if ok else "не найден"))
+        evidence.append(f"Раздел «{name}» {scope_label}: " + ("найден" if ok else "не найден"))
 
     if sections_found >= 5 and policy_url:
         return {
@@ -731,17 +742,14 @@ def check_cookie_banner(pages_html: dict) -> Tuple[dict, list]:
 # ============================================================================
 
 ERID_PATTERN = re.compile(r"erid\s*[:=]?\s*[a-zA-Z0-9]{8,}", re.IGNORECASE)
-# «На правах рекламы» — однозначный маркер интернет-рекламы (38-ФЗ)
-AD_LABEL_STRONG = re.compile(r"на правах рекламы|реклама\s*\.|sponsored\s*post|promoted by", re.IGNORECASE)
-# Метка «реклама» в характерных рекламных блоках (data-ad, ad-banner и т.п.)
-AD_BLOCK_PATTERN = re.compile(
-    r"data-ad-|class=[\"'][^\"']*\b(ad|advert|banner|promo)[a-z\-]*\b|"
-    r"id=[\"'][^\"']*\b(ad|advert|banner|promo)[a-z\-]*\b",
+# Сильные маркеры интернет-рекламы (ст. 18.1 38-ФЗ)
+AD_LABEL_STRONG = re.compile(
+    r"на\s+правах\s+рекламы|реклама\s*[:.\|]|sponsored\s+post|promoted\s+by",
     re.IGNORECASE,
 )
 ADVERTISER_KW = [
     "рекламодатель", "сведения о рекламодателе", "идентификатор рекламы",
-    "advertiser", "ad ID",
+    "advertiser id",
 ]
 
 
@@ -922,7 +930,22 @@ def check_company_requisites(pages_html: dict) -> Tuple[dict, list]:
 # ============================================================================
 
 def detect_language(pages_html: dict) -> str:
-    """Возвращает 'ru' или 'other' по соотношению кириллицы к латинице."""
+    """
+    Определяет язык сайта.
+    1. Сначала смотрим в <html lang="...">
+    2. Если не найдено — по соотношению кириллицы/латиницы.
+    """
+    # 1. <html lang="...">
+    for html in pages_html.values():
+        m = re.search(r'<html[^>]+lang=["\']?([a-zA-Z\-]+)', html, re.IGNORECASE)
+        if m:
+            lang = m.group(1).lower()
+            if lang.startswith("ru"):
+                return "ru"
+            # Если явно указан другой язык — считаем не русским, даже если есть кириллица
+            return "other"
+
+    # 2. По содержимому
     text = _all_text(pages_html)
     if not text:
         return "other"
@@ -930,7 +953,7 @@ def detect_language(pages_html: dict) -> str:
     lat = sum(1 for ch in text if "a" <= ch <= "z")
     if cyr == 0 and lat == 0:
         return "other"
-    return "ru" if cyr / max(cyr + lat, 1) >= 0.25 else "other"
+    return "ru" if cyr / max(cyr + lat, 1) >= 0.30 else "other"
 
 
 # Признаки требуют чёткого совпадения с границами слов

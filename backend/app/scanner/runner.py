@@ -77,6 +77,33 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
 
     await update_progress(55, f"Загружено {len(pages_html)} страниц")
 
+    # Принудительно загружаем ключевые legal-страницы, если их ещё нет
+    LEGAL_HINTS = [
+        "polic", "privac", "personal", "конфиденциал", "персональн", "обработк", "pdn",
+        "offer", "оферт", "договор", "соглашен", "terms", "agreement",
+        "contact", "контакт", "rekvizit", "реквизит",
+        "cookie", "куки",
+        "доставк", "delivery", "оплат", "payment", "возврат", "return", "refund",
+    ]
+    extra_urls = []
+    for link in links:
+        low = link.lower()
+        if link in pages_html:
+            continue
+        if any(h in low for h in LEGAL_HINTS):
+            extra_urls.append(link)
+        if len(extra_urls) >= 6:
+            break
+    if extra_urls:
+        extra_results = await asyncio.gather(*(fetch_page(u, TIMEOUT) for u in extra_urls), return_exceptions=True)
+        for src, res in zip(extra_urls, extra_results):
+            if isinstance(res, Exception):
+                continue
+            page_html, page_url = res
+            if page_html:
+                pages_html[page_url or src] = page_html
+        await update_progress(58, f"Догружено legal-страниц: +{len(extra_urls)}")
+
     # Определяем тип сайта и язык
     site_type, site_type_signals = detect_site_type(pages_html)
     site_type_label = SITE_TYPE_LABELS.get(site_type, site_type)
