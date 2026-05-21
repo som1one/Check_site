@@ -152,19 +152,19 @@ export default function ScanPage() {
                       <div className="text-2xl font-bold text-red-500">
                         {scan.issues.filter(i => i.severity === 'high').length}
                       </div>
-                      <div className="text-xs text-slate-500 mt-1">Высокий риск</div>
+                      <div className="text-xs text-slate-500 mt-1">Серьёзных нарушений</div>
                     </div>
                     <div className="card text-center py-4">
                       <div className="text-2xl font-bold text-amber-500">
                         {scan.issues.filter(i => i.severity === 'medium').length}
                       </div>
-                      <div className="text-xs text-slate-500 mt-1">Средний риск</div>
+                      <div className="text-xs text-slate-500 mt-1">Средней важности</div>
                     </div>
                     <div className="card text-center py-4">
                       <div className="text-2xl font-bold text-emerald-500">
                         {scan.issues.filter(i => i.severity === 'low').length}
                       </div>
-                      <div className="text-xs text-slate-500 mt-1">Низкий риск</div>
+                      <div className="text-xs text-slate-500 mt-1">Незначительных</div>
                     </div>
                   </div>
 

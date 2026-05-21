@@ -43,9 +43,11 @@ export default function ScoreBadge({ score, riskLevel, size = 'md' }: ScoreBadge
     <div className="flex flex-col items-center gap-2">
       <div
         className={`${sizeClasses[size]} ${config.bg} rounded-full flex items-center justify-center text-white font-bold ring-4 ${config.ring}`}
+        title={`Итоговый балл: ${score} из 100`}
       >
         {score}
       </div>
+      <div className="text-[10px] text-slate-400 -mt-1">балл из 100</div>
       <span className={`text-xs font-semibold px-2.5 py-0.5 rounded-full ${config.lightBg} ${config.text}`}>
         {config.label}
       </span>
