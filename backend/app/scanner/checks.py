@@ -179,21 +179,27 @@ def _all_html(pages_html: dict) -> str:
     return " ".join(pages_html.values()).lower()
 
 
-def _find_link_by_keywords(pages_html: dict, links: List[str], keywords: List[str]) -> Optional[str]:
+def _find_link_by_keywords(
+    pages_html: dict,
+    links: List[str],
+    url_keywords: List[str],
+    anchor_keywords: Optional[List[str]] = None,
+) -> Optional[str]:
     """
     Ищем URL: сначала по пути URL, потом — по anchor text ссылки на главной.
     """
-    keywords = [k.lower() for k in keywords]
+    url_keywords = [k.lower() for k in url_keywords]
+    anchor_keywords = [k.lower() for k in (anchor_keywords or url_keywords)]
 
     # 1. совпадение по URL
     for url in pages_html:
-        if any(kw in url.lower() for kw in keywords):
+        if any(kw in url.lower() for kw in url_keywords):
             return url
     for link in links:
-        if any(kw in link.lower() for kw in keywords):
+        if any(kw in link.lower() for kw in url_keywords):
             return link
 
-    # 2. совпадение по anchor text среди ссылок на загруженных страницах
+    # 2. совпадение по anchor text
     for html in pages_html.values():
         try:
             soup = BeautifulSoup(html, "lxml")
@@ -202,7 +208,7 @@ def _find_link_by_keywords(pages_html: dict, links: List[str], keywords: List[st
         for tag in soup.find_all("a", href=True):
             text = tag.get_text(" ", strip=True).lower()
             title = (tag.get("title") or "").lower()
-            if any(kw in text for kw in keywords) or any(kw in title for kw in keywords):
+            if any(kw in text for kw in anchor_keywords) or any(kw in title for kw in anchor_keywords):
                 href = (tag.get("href") or "").strip()
                 if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
                     return href
@@ -298,9 +304,15 @@ async def check_https_detailed(final_url: str, timeout: int = TIMEOUT) -> Tuple[
 # 2. 152-ФЗ — Политика обработки персональных данных
 # ============================================================================
 
-PRIVACY_PAGE_KW = [
-    "policy", "privacy", "personal-data", "personal_data", "pdn",
-    "политик", "конфиденциал", "персональн", "данн", "обработк",
+PRIVACY_PAGE_URL_KW = [
+    "/policy", "/privacy", "/personal-data", "/personal_data", "/pdn",
+    "/политика", "/конфиденциал", "/персональн",
+    "policy.html", "privacy.html", "privacy-policy",
+]
+PRIVACY_PAGE_ANCHOR_KW = [
+    "политика конфиденциальности", "политика обработки",
+    "обработка персональных данных", "обработке персональных данных",
+    "конфиденциальность", "privacy policy", "privacy",
 ]
 
 PRIVACY_SECTION_KW = {
@@ -333,7 +345,7 @@ PRIVACY_SECTION_KW = {
 
 
 def check_privacy_policy(pages_html: dict, links: List[str]) -> Tuple[dict, list]:
-    policy_url = _find_link_by_keywords(pages_html, links, PRIVACY_PAGE_KW)
+    policy_url = _find_link_by_keywords(pages_html, links, PRIVACY_PAGE_URL_KW, PRIVACY_PAGE_ANCHOR_KW)
 
     # Если политика — отдельная страница, проверяем содержимое именно её,
     # иначе ищем по всем загруженным страницам.
@@ -742,9 +754,10 @@ def check_cookie_banner(pages_html: dict) -> Tuple[dict, list]:
 # ============================================================================
 
 ERID_PATTERN = re.compile(r"erid\s*[:=]?\s*[a-zA-Z0-9]{8,}", re.IGNORECASE)
-# Сильные маркеры интернет-рекламы (ст. 18.1 38-ФЗ)
+# Однозначные маркеры интернет-рекламы (ст. 18.1 38-ФЗ).
+# Простое слово «Реклама» в навигации/меню НЕ считается — только явные фразы.
 AD_LABEL_STRONG = re.compile(
-    r"на\s+правах\s+рекламы|реклама\s*[:.\|]|sponsored\s+post|promoted\s+by",
+    r"на\s+правах\s+рекламы|информация\s+носит\s+рекламный\s+характер|sponsored\s+post|promoted\s+by",
     re.IGNORECASE,
 )
 ADVERTISER_KW = [
