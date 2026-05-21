@@ -5,6 +5,8 @@ from app.scanner.checks import (
     fetch_page_playwright,
     fetch_sitemap_links,
     extract_all_internal_links,
+    detect_site_type,
+    SITE_TYPE_LABELS,
     check_https_detailed,
     check_privacy_policy,
     check_form_consent,
@@ -62,10 +64,10 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
 
     await update_progress(35, f"Найдено {len(links)} страниц для проверки")
 
-    # Загрузка дополнительных страниц
-    fetch_tasks = [fetch_page(link, TIMEOUT) for link in links[:10]]
+    # Загрузка дополнительных страниц (приоритет — по anchor text)
+    fetch_tasks = [fetch_page(link, TIMEOUT) for link in links[:12]]
     results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-    for link, result in zip(links[:10], results):
+    for link, result in zip(links[:12], results):
         if isinstance(result, Exception):
             continue
         page_html, page_url = result
@@ -73,6 +75,10 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
             pages_html[page_url or link] = page_html
 
     await update_progress(55, f"Загружено {len(pages_html)} страниц")
+
+    # Определяем тип сайта по содержимому
+    site_type, site_type_signals = detect_site_type(pages_html)
+    site_type_label = SITE_TYPE_LABELS.get(site_type, site_type)
 
     # robots.txt + sitemap.xml
     robots_ok, sitemap_ok = await check_robots_sitemap(final_url)
@@ -118,8 +124,8 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
     all_checks.append(req_check); all_issues.extend(req_issues)
     await update_progress(85, "Проверка реквизитов компании")
 
-    # 9. ЗоЗПП — документы для потребителей
-    cr_check, cr_issues = check_consumer_rights(pages_html, links)
+    # 9. ЗоЗПП — документы для потребителей (зависит от типа сайта)
+    cr_check, cr_issues = check_consumer_rights(pages_html, links, site_type)
     all_checks.append(cr_check); all_issues.extend(cr_issues)
 
     # 10. 436-ФЗ — возрастная маркировка
@@ -157,6 +163,9 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
 
     meta = {
         "final_url": final_url,
+        "site_type": site_type,
+        "site_type_label": site_type_label,
+        "site_type_signals": site_type_signals,
         "pages_count": len(pages_html),
         "links_found": len(links),
         "robots_txt": robots_ok,

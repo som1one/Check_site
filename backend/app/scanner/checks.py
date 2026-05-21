@@ -85,45 +85,81 @@ async def fetch_sitemap_links(base_url: str, timeout: int = TIMEOUT) -> List[str
 
 
 def extract_all_internal_links(html: str, base_url: str) -> List[str]:
+    """
+    Возвращает список внутренних ссылок, отсортированный по приоритету:
+    1. Ссылки по anchor text (политика, оферта, контакты и т.д.)
+    2. Ссылки в footer/header/nav
+    3. Все остальные
+    """
     soup = BeautifulSoup(html, "lxml")
     base_domain = urlparse(base_url).netloc
     seen = set()
-    important = []
-    normal = []
+    by_anchor = []   # совпадение по anchor text — самый высокий приоритет
+    in_layout = []   # ссылки в footer/header/nav
+    others = []
 
-    priority_selectors = [
+    # Ключевые слова для поиска по тексту/href ссылки
+    anchor_keywords = [
+        "полит", "конфиденциал", "персональн", "данн", "обработк", "privacy",
+        "оферт", "договор", "соглашен", "правил пользован", "user agreement", "terms",
+        "контакт", "contact",
+        "реквизит", "о компан", "о нас", "about",
+        "возврат", "обмен", "доставк", "оплат", "гарант",
+        "cookie", "куки",
+        "потреб", "защит",
+    ]
+    href_keywords = [
+        "policy", "privacy", "personal", "pdn", "agreement", "offer", "terms",
+        "contact", "about", "info", "rules", "consumer", "delivery", "payment",
+        "warranty", "return", "refund", "cookie",
+    ]
+
+    layout_selectors = [
         "footer a", "header a", "nav a", ".footer a", ".header a",
         ".menu a", ".navbar a", "[class*=footer] a", "[class*=header] a",
         "[class*=menu] a", "[class*=nav] a",
     ]
+    layout_tags = set()
+    for selector in layout_selectors:
+        for tag in soup.select(selector):
+            layout_tags.add(id(tag))
 
-    def process_tag(tag, is_priority: bool):
+    def add_link(url: str, bucket: list):
+        if url in seen:
+            return
+        seen.add(url)
+        bucket.append(url)
+
+    for tag in soup.find_all("a", href=True):
         href = (tag.get("href") or "").strip()
         if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            return
+            continue
         full_url = urljoin(base_url, href)
         parsed = urlparse(full_url)
         if parsed.netloc != base_domain:
-            return
+            continue
         clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         if parsed.query:
             clean += f"?{parsed.query}"
-        if clean in seen:
-            return
-        seen.add(clean)
-        if is_priority:
-            important.append(clean)
+
+        anchor_text = tag.get_text(" ", strip=True).lower()
+        href_lower = href.lower()
+        title_attr = (tag.get("title") or "").lower()
+
+        is_keyword_match = (
+            any(kw in anchor_text for kw in anchor_keywords)
+            or any(kw in href_lower for kw in href_keywords)
+            or any(kw in title_attr for kw in anchor_keywords)
+        )
+
+        if is_keyword_match:
+            add_link(clean, by_anchor)
+        elif id(tag) in layout_tags:
+            add_link(clean, in_layout)
         else:
-            normal.append(clean)
+            add_link(clean, others)
 
-    for selector in priority_selectors:
-        for tag in soup.select(selector):
-            process_tag(tag, True)
-
-    for tag in soup.find_all("a", href=True):
-        process_tag(tag, False)
-
-    result = important + [u for u in normal if u not in set(important)]
+    result = by_anchor + in_layout + others
     return result[:MAX_PAGES]
 
 
@@ -144,14 +180,33 @@ def _all_html(pages_html: dict) -> str:
 
 
 def _find_link_by_keywords(pages_html: dict, links: List[str], keywords: List[str]) -> Optional[str]:
-    """Ищем URL, в пути которого есть одно из ключевых слов."""
+    """
+    Ищем URL: сначала по пути URL, потом — по anchor text ссылки на главной.
+    """
+    keywords = [k.lower() for k in keywords]
+
+    # 1. совпадение по URL
     for url in pages_html:
-        u = url.lower()
-        if any(kw in u for kw in keywords):
+        if any(kw in url.lower() for kw in keywords):
             return url
     for link in links:
         if any(kw in link.lower() for kw in keywords):
             return link
+
+    # 2. совпадение по anchor text среди ссылок на загруженных страницах
+    for html in pages_html.values():
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            continue
+        for tag in soup.find_all("a", href=True):
+            text = tag.get_text(" ", strip=True).lower()
+            title = (tag.get("title") or "").lower()
+            if any(kw in text for kw in keywords) or any(kw in title for kw in keywords):
+                href = (tag.get("href") or "").strip()
+                if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                    return href
+
     return None
 
 
@@ -846,19 +901,130 @@ def check_company_requisites(pages_html: dict) -> Tuple[dict, list]:
 
 
 # ============================================================================
-# 9. ЗоЗПП — Документы для потребителей
+# Определение типа сайта
+# ============================================================================
+
+ECOMMERCE_KW = [
+    "корзина", "в корзину", "добавить в корзину", "купить", "оформить заказ",
+    "checkout", "cart", "basket", "add to cart", "buy now", "shop",
+    "мой заказ", "ваш заказ", "товары в корзине",
+]
+ECOMMERCE_PRICE_PATTERN = re.compile(r"\d[\d\s]{1,8}\s*(?:₽|руб\.?|rub\b|р\.)", re.IGNORECASE)
+
+SERVICE_KW = [
+    "тариф", "тарифы", "подписка", "подписк", "оформить подписку",
+    "личный кабинет", "мой профиль", "subscription", "pricing", "plans",
+    "оплатить тариф", "продлить подписку",
+]
+
+CORPORATE_KW = [
+    "наши услуги", "услуги компании", "оставить заявку", "заказать звонок",
+    "обратная связь", "консультация", "наши проекты", "портфолио",
+    "о нас", "о компании", "наши клиенты", "сертификаты",
+]
+
+INFO_KW = [
+    "статьи", "новости", "блог", "публикации", "архив",
+    "категории", "теги", "автор", "комментариев",
+]
+
+
+def detect_site_type(pages_html: dict) -> Tuple[str, List[str]]:
+    """
+    Возвращает тип сайта: 'ecommerce' | 'service' | 'corporate' | 'informational'
+    и список признаков, по которым тип был определён.
+    """
+    all_text = _all_text(pages_html)
+    all_html_text = _all_html(pages_html)
+
+    signals = []
+
+    # E-commerce
+    ecommerce_hits = [kw for kw in ECOMMERCE_KW if kw in all_text]
+    price_count = len(ECOMMERCE_PRICE_PATTERN.findall(all_html_text))
+    has_product_og = "og:type" in all_html_text and "product" in all_html_text
+    ecommerce_score = len(ecommerce_hits) + (2 if price_count >= 5 else 0) + (3 if has_product_og else 0)
+
+    # Service / SaaS
+    service_hits = [kw for kw in SERVICE_KW if kw in all_text]
+    service_score = len(service_hits)
+
+    # Corporate / услуги
+    corporate_hits = [kw for kw in CORPORATE_KW if kw in all_text]
+    corporate_score = len(corporate_hits)
+
+    # Informational
+    info_hits = [kw for kw in INFO_KW if kw in all_text]
+    article_tags = sum(html.lower().count("<article") for html in pages_html.values())
+    info_score = len(info_hits) + (3 if article_tags >= 5 else (1 if article_tags >= 2 else 0))
+
+    if ecommerce_score >= 3:
+        if ecommerce_hits:
+            signals.append(f"e-commerce признаки: {', '.join(ecommerce_hits[:3])}")
+        if price_count >= 5:
+            signals.append(f"найдено {price_count} цен")
+        return "ecommerce", signals
+
+    if service_score >= 2 and service_score > ecommerce_score:
+        signals.append(f"сервис/SaaS: {', '.join(service_hits[:3])}")
+        return "service", signals
+
+    if info_score >= 4 and info_score > corporate_score:
+        signals.append(f"информационный: {info_score} признаков, {article_tags} тегов <article>")
+        return "informational", signals
+
+    if corporate_score >= 2:
+        signals.append(f"корпоративный/услуги: {', '.join(corporate_hits[:3])}")
+        return "corporate", signals
+
+    if info_score >= 2:
+        signals.append(f"информационный: {', '.join(info_hits[:3])}")
+        return "informational", signals
+
+    return "corporate", ["тип не определён, используются мягкие правила"]
+
+
+SITE_TYPE_LABELS = {
+    "ecommerce": "Интернет-магазин",
+    "service": "Сервис / SaaS",
+    "corporate": "Корпоративный сайт / услуги",
+    "informational": "Информационный сайт / блог",
+}
+
+
+# ============================================================================
+# 9. ЗоЗПП — Документы для потребителей (зависит от типа сайта)
 # ============================================================================
 
 CONSUMER_DOCS = {
-    "Оферта/договор": ["оферта", "публичная оферта", "договор", "договор-оферта"],
-    "Возврат/обмен": ["возврат", "обмен товара", "возврата", "вернуть товар"],
+    "Оферта/договор": ["оферта", "публичная оферта", "договор-оферта", "пользовательский договор"],
+    "Возврат/обмен": ["возврат", "обмен товара", "вернуть товар", "возврата товара"],
     "Доставка": ["доставка", "способы доставки", "условия доставки"],
     "Оплата": ["оплата", "способы оплаты", "способ оплаты"],
     "Гарантия": ["гарантия", "гарантийн", "срок гарантии"],
 }
 
+# Какие документы обязательны для какого типа сайта
+CONSUMER_REQUIRED_BY_TYPE = {
+    "ecommerce": {"Оферта/договор", "Возврат/обмен", "Доставка", "Оплата", "Гарантия"},
+    "service": {"Оферта/договор", "Оплата"},
+    "corporate": set(),
+    "informational": set(),
+}
 
-def check_consumer_rights(pages_html: dict, links: List[str]) -> Tuple[dict, list]:
+
+def check_consumer_rights(pages_html: dict, links: List[str], site_type: str) -> Tuple[dict, list]:
+    type_label = SITE_TYPE_LABELS.get(site_type, site_type)
+
+    # Информационные сайты вообще не подпадают под ЗоЗПП-документы
+    if site_type == "informational":
+        return {
+            "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
+            "status": "passed",
+            "details": f"Тип сайта: {type_label}. Требования к документам интернет-магазина не применяются",
+            "evidence": [],
+        }, []
+
     all_text = _all_text(pages_html)
     for link in links:
         all_text += " " + link.lower()
@@ -871,50 +1037,99 @@ def check_consumer_rights(pages_html: dict, links: List[str]) -> Tuple[dict, lis
         if is_found:
             evidence.append(f"Найдено: {doc}")
 
-    found_count = sum(found.values())
-    total = len(CONSUMER_DOCS)
-    missing = [k for k, v in found.items() if not v]
+    required = CONSUMER_REQUIRED_BY_TYPE.get(site_type, set())
+    missing_required = [d for d in required if not found[d]]
+    total_required = len(required)
+    found_required = total_required - len(missing_required)
 
-    if found_count >= 4:
+    # Корпоративный сайт — никаких обязательных документов, проверка справочная
+    if site_type == "corporate":
+        all_found_count = sum(found.values())
+        if all_found_count >= 1:
+            return {
+                "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
+                "status": "passed",
+                "details": f"Тип сайта: {type_label}. Найдено {all_found_count} из 5 потребительских документов (для корпоративного сайта обязательных нет)",
+                "evidence": evidence,
+            }, []
         return {
             "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
             "status": "passed",
-            "details": f"Документы для потребителей найдены ({found_count}/{total})" + (f". Не хватает: {', '.join(missing)}" if missing else ""),
-            "evidence": evidence,
+            "details": f"Тип сайта: {type_label}. Документы интернет-магазина не требуются",
+            "evidence": [],
         }, []
 
-    if found_count >= 2:
+    # Service: нужны оферта + оплата
+    if site_type == "service":
+        if not missing_required:
+            return {
+                "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
+                "status": "passed",
+                "details": f"Тип сайта: {type_label}. Найдены обязательные документы: {', '.join(sorted(required))}",
+                "evidence": evidence,
+            }, []
+
         return {
             "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
             "status": "warning",
-            "details": f"Часть документов отсутствует ({found_count}/{total}). Не хватает: {', '.join(missing)}",
+            "details": f"Тип сайта: {type_label}. Не хватает обязательных документов: {', '.join(missing_required)}",
+            "evidence": evidence,
+        }, [{
+            "code": "missing_consumer_docs_service",
+            "title": f"Не хватает документов: {', '.join(missing_required)}",
+            "severity": "medium", "category": "consumer_rights",
+            "description": (
+                f"Сайт классифицирован как {type_label.lower()}. "
+                f"Для приёма платежей необходимы: оферта (договор) и описание условий оплаты. "
+                f"Не найдено: {', '.join(missing_required)}."
+            ),
+            "recommendation": f"Опубликуйте: {', '.join(missing_required)}.",
+            "evidence": evidence, "possible_fine": 50000,
+        }]
+
+    # E-commerce: все 5 обязательны
+    if found_required == total_required:
+        return {
+            "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
+            "status": "passed",
+            "details": f"Тип сайта: {type_label}. Все обязательные документы найдены ({found_required}/{total_required})",
+            "evidence": evidence,
+        }, []
+
+    if found_required >= 3:
+        return {
+            "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
+            "status": "warning",
+            "details": f"Тип сайта: {type_label}. Найдено {found_required} из {total_required}. Не хватает: {', '.join(missing_required)}",
             "evidence": evidence,
         }, [{
             "code": "missing_consumer_docs",
-            "title": f"Не хватает документов: {', '.join(missing)}",
+            "title": f"Не хватает документов: {', '.join(missing_required)}",
             "severity": "medium", "category": "consumer_rights",
             "description": (
-                f"На сайте найдено только {found_count} из {total} обязательных для интернет-магазинов документов. "
-                f"Не хватает: {', '.join(missing)}. Это нарушение Закона «О защите прав потребителей»."
+                f"Сайт классифицирован как {type_label.lower()}. "
+                f"Найдено {found_required} из {total_required} обязательных документов. "
+                f"Не хватает: {', '.join(missing_required)}. Нарушение ЗоЗПП."
             ),
-            "recommendation": f"Добавьте отдельные страницы: {', '.join(missing)}.",
+            "recommendation": f"Опубликуйте отдельные страницы: {', '.join(missing_required)}.",
             "evidence": evidence, "possible_fine": 50000,
         }]
 
     return {
         "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
         "status": "failed",
-        "details": f"Большинство потребительских документов отсутствует ({found_count}/{total}). Не хватает: {', '.join(missing)}",
+        "details": f"Тип сайта: {type_label}. Найдено только {found_required} из {total_required} обязательных. Не хватает: {', '.join(missing_required)}",
         "evidence": evidence,
     }, [{
         "code": "missing_consumer_docs_critical",
         "title": "Критическое отсутствие документов для потребителей",
         "severity": "high", "category": "consumer_rights",
         "description": (
-            f"На сайте найдено только {found_count} из {total} обязательных документов: {', '.join(missing)} отсутствуют. "
-            "Для интернет-магазина это серьёзное нарушение ЗоЗПП."
+            f"Сайт классифицирован как {type_label.lower()}. "
+            f"Найдено только {found_required} из {total_required} обязательных документов. "
+            f"Не хватает: {', '.join(missing_required)}. Серьёзное нарушение ЗоЗПП."
         ),
-        "recommendation": "Срочно разработайте и разместите все обязательные документы (оферта, возврат, доставка, оплата, гарантия).",
+        "recommendation": "Срочно разработайте и разместите оферту, политику возврата, условия доставки, оплаты и гарантии.",
         "evidence": evidence, "possible_fine": 100000,
     }]
 
