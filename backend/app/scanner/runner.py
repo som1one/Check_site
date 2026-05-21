@@ -79,16 +79,19 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
 
     # Принудительно загружаем ключевые legal-страницы, если их ещё нет
     LEGAL_HINTS = [
-        "polic", "privac", "personal", "конфиденциал", "персональн", "обработк", "pdn",
-        "offer", "оферт", "договор", "соглашен", "terms", "agreement",
-        "contact", "контакт", "rekvizit", "реквизит",
-        "cookie", "куки",
-        "доставк", "delivery", "оплат", "payment", "возврат", "return", "refund",
+        "/polic", "/privac", "/personal", "/конфиденциал", "/персональн", "/pdn",
+        "/offer", "/оферт", "/договор", "/соглашен", "/terms", "/agreement",
+        "/contact", "/контакт", "/rekvizit", "/реквизит",
+        "/cookie", "/куки",
+        "/доставк", "/delivery", "/оплат", "/payment", "/возврат", "/return", "/refund",
     ]
+    LEGAL_EXCLUDE = ["dashboard", "advisor", "settings", "account", "myactivity", "controls"]
     extra_urls = []
     for link in links:
         low = link.lower()
         if link in pages_html:
+            continue
+        if any(ex in low for ex in LEGAL_EXCLUDE):
             continue
         if any(h in low for h in LEGAL_HINTS):
             extra_urls.append(link)

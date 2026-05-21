@@ -184,19 +184,27 @@ def _find_link_by_keywords(
     links: List[str],
     url_keywords: List[str],
     anchor_keywords: Optional[List[str]] = None,
+    exclude_keywords: Optional[List[str]] = None,
 ) -> Optional[str]:
     """
     Ищем URL: сначала по пути URL, потом — по anchor text ссылки на главной.
     """
     url_keywords = [k.lower() for k in url_keywords]
     anchor_keywords = [k.lower() for k in (anchor_keywords or url_keywords)]
+    exclude_keywords = [k.lower() for k in (exclude_keywords or [])]
+
+    def is_excluded(s: str) -> bool:
+        s = s.lower()
+        return any(ex in s for ex in exclude_keywords)
 
     # 1. совпадение по URL
     for url in pages_html:
-        if any(kw in url.lower() for kw in url_keywords):
+        u = url.lower()
+        if any(kw in u for kw in url_keywords) and not is_excluded(u):
             return url
     for link in links:
-        if any(kw in link.lower() for kw in url_keywords):
+        u = link.lower()
+        if any(kw in u for kw in url_keywords) and not is_excluded(u):
             return link
 
     # 2. совпадение по anchor text
@@ -208,10 +216,13 @@ def _find_link_by_keywords(
         for tag in soup.find_all("a", href=True):
             text = tag.get_text(" ", strip=True).lower()
             title = (tag.get("title") or "").lower()
+            href = (tag.get("href") or "").strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            if is_excluded(href):
+                continue
             if any(kw in text for kw in anchor_keywords) or any(kw in title for kw in anchor_keywords):
-                href = (tag.get("href") or "").strip()
-                if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
-                    return href
+                return href
 
     return None
 
@@ -312,7 +323,11 @@ PRIVACY_PAGE_URL_KW = [
 PRIVACY_PAGE_ANCHOR_KW = [
     "политика конфиденциальности", "политика обработки",
     "обработка персональных данных", "обработке персональных данных",
-    "конфиденциальность", "privacy policy", "privacy",
+    "конфиденциальность", "privacy policy",
+]
+PRIVACY_PAGE_EXCLUDE = [
+    "dashboard", "advisor", "settings", "account", "myactivity",
+    "report", "controls", "myaccount",
 ]
 
 PRIVACY_SECTION_KW = {
@@ -345,7 +360,11 @@ PRIVACY_SECTION_KW = {
 
 
 def check_privacy_policy(pages_html: dict, links: List[str]) -> Tuple[dict, list]:
-    policy_url = _find_link_by_keywords(pages_html, links, PRIVACY_PAGE_URL_KW, PRIVACY_PAGE_ANCHOR_KW)
+    policy_url = _find_link_by_keywords(
+        pages_html, links,
+        PRIVACY_PAGE_URL_KW, PRIVACY_PAGE_ANCHOR_KW,
+        exclude_keywords=PRIVACY_PAGE_EXCLUDE,
+    )
 
     # Если политика — отдельная страница, проверяем содержимое именно её,
     # иначе ищем по всем загруженным страницам.
