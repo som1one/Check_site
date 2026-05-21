@@ -61,11 +61,10 @@ services:
       start_period: 20s
 
   worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile.worker
+    image: siteguard-backend:latest
     container_name: siteguard_worker
     restart: unless-stopped
+    command: ["python", "-m", "app.workers.main"]
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -75,6 +74,8 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-siteguard}:${POSTGRES_PASSWORD:-siteguard_secret}@postgres:5432/${POSTGRES_DB:-siteguard}
       REDIS_URL: redis://redis:6379/0
     depends_on:
+      backend:
+        condition: service_started
       postgres:
         condition: service_healthy
       redis:
