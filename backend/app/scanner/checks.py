@@ -19,9 +19,12 @@ MAX_PAGES = 12
 TIMEOUT = 15
 
 
-# -- Crawler --
+# ============================================================================
+# Загрузка страниц
+# ============================================================================
 
 async def fetch_page(url: str, timeout: int = TIMEOUT) -> Tuple[Optional[str], Optional[str]]:
+    """HTTP-запрос с фолбэком на verify=False (для самоподписанных)."""
     try:
         async with httpx.AsyncClient(
             headers=HEADERS, follow_redirects=True, timeout=timeout, verify=True,
@@ -44,6 +47,7 @@ async def fetch_page(url: str, timeout: int = TIMEOUT) -> Tuple[Optional[str], O
 
 
 async def fetch_page_playwright(url: str, timeout: int = TIMEOUT) -> Optional[str]:
+    """Фолбэк через Playwright для SPA-сайтов."""
     try:
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
@@ -67,7 +71,10 @@ async def fetch_sitemap_links(base_url: str, timeout: int = TIMEOUT) -> List[str
         async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=timeout, verify=False) as client:
             r = await client.get(f"{base}/sitemap.xml")
             if r.status_code == 200:
-                soup = BeautifulSoup(r.text, "lxml-xml") or BeautifulSoup(r.text, "html.parser")
+                try:
+                    soup = BeautifulSoup(r.text, "lxml-xml")
+                except Exception:
+                    soup = BeautifulSoup(r.text, "html.parser")
                 for loc in soup.find_all("loc"):
                     href = loc.get_text(strip=True)
                     if href:
@@ -92,7 +99,7 @@ def extract_all_internal_links(html: str, base_url: str) -> List[str]:
 
     def process_tag(tag, is_priority: bool):
         href = (tag.get("href") or "").strip()
-        if not href or href.startswith("#") or href.startswith("javascript:") or href.startswith("mailto:") or href.startswith("tel:"):
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
             return
         full_url = urljoin(base_url, href)
         parsed = urlparse(full_url)
@@ -120,7 +127,9 @@ def extract_all_internal_links(html: str, base_url: str) -> List[str]:
     return result[:MAX_PAGES]
 
 
-# -- Helpers --
+# ============================================================================
+# Вспомогательные функции
+# ============================================================================
 
 def _all_text(pages_html: dict) -> str:
     combined = ""
@@ -132,12 +141,29 @@ def _all_text(pages_html: dict) -> str:
 
 def _all_html(pages_html: dict) -> str:
     return " ".join(pages_html.values()).lower()
-# -- 1. HTTPS --
+
+
+def _find_link_by_keywords(pages_html: dict, links: List[str], keywords: List[str]) -> Optional[str]:
+    """Ищем URL, в пути которого есть одно из ключевых слов."""
+    for url in pages_html:
+        u = url.lower()
+        if any(kw in u for kw in keywords):
+            return url
+    for link in links:
+        if any(kw in link.lower() for kw in keywords):
+            return link
+    return None
+
+
+# ============================================================================
+# 1. HTTPS / SSL
+# ============================================================================
 
 async def check_https_detailed(final_url: str, timeout: int = TIMEOUT) -> Tuple[dict, list]:
     is_https = final_url.startswith("https://")
     hsts = False
-    evidence = [final_url]
+    redirect_ok = False
+    evidence = [f"Итоговый URL: {final_url}"]
 
     if is_https:
         try:
@@ -145,7 +171,9 @@ async def check_https_detailed(final_url: str, timeout: int = TIMEOUT) -> Tuple[
                 resp = await client.get(final_url)
                 hsts = "strict-transport-security" in {k.lower() for k in resp.headers.keys()}
                 if hsts:
-                    evidence.append("HSTS header present")
+                    evidence.append("Заголовок HSTS присутствует")
+                else:
+                    evidence.append("Заголовок HSTS не найден")
         except Exception:
             pass
 
@@ -153,136 +181,208 @@ async def check_https_detailed(final_url: str, timeout: int = TIMEOUT) -> Tuple[
         try:
             async with httpx.AsyncClient(headers=HEADERS, timeout=timeout, follow_redirects=True, verify=False) as client:
                 r = await client.get(http_url)
-                if r.url.startswith("https://"):
-                    evidence.append("HTTP->HTTPS redirect works")
+                if str(r.url).startswith("https://"):
+                    redirect_ok = True
+                    evidence.append("Редирект HTTP → HTTPS работает")
+                else:
+                    evidence.append("Редирект HTTP → HTTPS не настроен")
         except Exception:
             pass
 
-    if is_https and hsts:
-        return {"code": "https", "title": "HTTPS", "status": "passed",
-                "details": "HTTPS + HSTS", "evidence": evidence}, []
+    if is_https and hsts and redirect_ok:
+        return {
+            "code": "https", "title": "Защищённое соединение HTTPS",
+            "status": "passed",
+            "details": "HTTPS настроен, HSTS включён, редирект с HTTP работает",
+            "evidence": evidence,
+        }, []
+
+    if is_https and not hsts:
+        return {
+            "code": "https", "title": "Защищённое соединение HTTPS",
+            "status": "warning",
+            "details": "HTTPS работает, но HSTS не настроен" + ("" if redirect_ok else "; редирект с HTTP не настроен"),
+            "evidence": evidence,
+        }, [{
+            "code": "no_hsts", "title": "Не настроен HSTS",
+            "severity": "low", "category": "technical",
+            "description": "Заголовок Strict-Transport-Security отсутствует. Без HSTS возможны атаки с понижением протокола до HTTP.",
+            "recommendation": "Добавьте заголовок Strict-Transport-Security: max-age=31536000; includeSubDomains в конфигурацию веб-сервера.",
+            "evidence": evidence, "possible_fine": None,
+        }]
 
     if is_https:
-        return {"code": "https", "title": "HTTPS", "status": "warning",
-                "details": "HTTPS OK, no HSTS", "evidence": evidence}, [{
-            "code": "no_hsts", "title": "No HSTS", "severity": "low", "category": "technical",
-            "description": "Strict-Transport-Security missing.",
-            "recommendation": "Add HSTS header.", "evidence": evidence, "possible_fine": None}]
+        return {
+            "code": "https", "title": "Защищённое соединение HTTPS",
+            "status": "warning",
+            "details": "HTTPS работает, но редирект с HTTP не настроен",
+            "evidence": evidence,
+        }, [{
+            "code": "no_http_redirect", "title": "Нет редиректа с HTTP на HTTPS",
+            "severity": "low", "category": "technical",
+            "description": "При обращении по HTTP браузер не перенаправляется на HTTPS, что снижает уровень защиты.",
+            "recommendation": "Настройте 301-редирект с http:// на https:// для всех страниц.",
+            "evidence": evidence, "possible_fine": None,
+        }]
 
-    return {"code": "https", "title": "HTTPS", "status": "failed",
-            "details": "No HTTPS", "evidence": evidence}, [{
-        "code": "no_https", "title": "No HTTPS", "severity": "high", "category": "technical",
-        "description": "Data transmitted in plain text.",
-        "recommendation": "Install SSL certificate.", "evidence": evidence, "possible_fine": None}]
+    return {
+        "code": "https", "title": "Защищённое соединение HTTPS",
+        "status": "failed",
+        "details": "Сайт работает по незащищённому протоколу HTTP",
+        "evidence": evidence,
+    }, [{
+        "code": "no_https", "title": "Сайт не использует HTTPS",
+        "severity": "high", "category": "technical",
+        "description": "Сайт работает по незащищённому протоколу HTTP. Данные пользователей (пароли, личная информация) передаются в открытом виде и могут быть перехвачены.",
+        "recommendation": "Установите SSL-сертификат (Let's Encrypt — бесплатно) и настройте редирект с HTTP на HTTPS.",
+        "evidence": evidence, "possible_fine": None,
+    }]
 
 
-# -- 2. Privacy Policy --
+# ============================================================================
+# 2. 152-ФЗ — Политика обработки персональных данных
+# ============================================================================
+
+PRIVACY_PAGE_KW = [
+    "policy", "privacy", "personal-data", "personal_data", "pdn",
+    "политик", "конфиденциал", "персональн", "данн", "обработк",
+]
+
+PRIVACY_SECTION_KW = {
+    "Цели обработки": [
+        "цели обработки", "цель обработки", "цели сбора", "цели использования",
+        "purposes of processing", "purpose of processing",
+    ],
+    "Перечень данных": [
+        "перечень персональных данных", "категории персональных данных",
+        "состав персональных данных", "какие данные мы собираем",
+        "list of personal data", "data categories",
+    ],
+    "Сроки хранения": [
+        "срок хранения", "сроки хранения", "период хранения", "уничтожение",
+        "хранятся в течение", "retention period", "storage period",
+    ],
+    "Права субъектов": [
+        "права субъекта", "права пользователя", "вы имеете право",
+        "отозвать согласие", "отзыв согласия", "withdraw consent",
+    ],
+    "Меры защиты": [
+        "меры защиты", "обеспечение безопасности", "шифрование",
+        "защита персональных данных", "data protection", "security measures",
+    ],
+    "Передача третьим лицам": [
+        "третьим лицам", "третьи лица", "передача данных", "раскрытие",
+        "third parties",
+    ],
+}
+
 
 def check_privacy_policy(pages_html: dict, links: List[str]) -> Tuple[dict, list]:
     all_text = _all_text(pages_html)
-    required_sections = {
-        "purposes": ["goals of processing", "purpose of processing", "for what", "purposes of collection"],
-        "data_list": ["list", "data categories", "we collect", "what data"],
-        "retention": ["retention period", "storage period", "stored", "destruction"],
-        "rights": ["subject rights", "user rights", "you have the right", "revoke", "withdrawal of consent"],
-        "protection": ["protection measures", "security", "data protection", "encryption"],
-        "third_parties": ["third parties", "to third parties", "data transfer", "disclosure"],
-    }
-    found_sections = {k: any(kw in all_text for kw in v) for k, v in required_sections.items()}
 
-    policy_url = None
-    policy_kw = ["policy", "privacy", "personal data", "data processing"]
-    for url in pages_html:
-        if any(kw in url.lower() for kw in policy_kw):
-            policy_url = url; break
-    if not policy_url:
-        for link in links:
-            if any(kw in link.lower() for kw in policy_kw):
-                policy_url = link; break
-
+    found_sections = {name: any(kw in all_text for kw in kws) for name, kws in PRIVACY_SECTION_KW.items()}
     sections_found = sum(found_sections.values())
-    total = len(required_sections)
-    evidence = ([policy_url] if policy_url else []) + [
-        f"Section '{k}': {'found' if v else 'missing'}" for k, v in found_sections.items()]
+    total = len(PRIVACY_SECTION_KW)
+    missing_sections = [name for name, ok in found_sections.items() if not ok]
+
+    policy_url = _find_link_by_keywords(pages_html, links, PRIVACY_PAGE_KW)
+
+    evidence = []
+    if policy_url:
+        evidence.append(f"Страница политики: {policy_url}")
+    for name, ok in found_sections.items():
+        evidence.append(f"Раздел «{name}»: " + ("найден" if ok else "не найден"))
 
     if sections_found >= 5 and policy_url:
-        return {"code": "privacy_policy", "title": "Privacy Policy",
-                "status": "passed", "details": f"Found ({sections_found}/{total} sections)",
-                "evidence": evidence}, []
+        return {
+            "code": "privacy_policy", "title": "152-ФЗ — Политика обработки персональных данных",
+            "status": "passed",
+            "details": f"Политика найдена, раскрыто {sections_found} из {total} обязательных разделов",
+            "evidence": evidence,
+        }, []
 
     if sections_found >= 3 and policy_url:
-        return {"code": "privacy_policy", "title": "Privacy Policy",
-                "status": "warning", "details": f"Incomplete ({sections_found}/{total})",
-                "evidence": evidence}, [{
-            "code": "incomplete_privacy_policy", "title": "Incomplete privacy policy",
+        return {
+            "code": "privacy_policy", "title": "152-ФЗ — Политика обработки персональных данных",
+            "status": "warning",
+            "details": f"Политика найдена, но раскрыта не полностью ({sections_found}/{total}). Не хватает: {', '.join(missing_sections)}",
+            "evidence": evidence,
+        }, [{
+            "code": "incomplete_privacy_policy",
+            "title": "Политика обработки персональных данных раскрыта не полностью",
             "severity": "medium", "category": "personal_data",
-            "description": f"Only {sections_found}/{total} sections found.",
-            "recommendation": "Complete the policy per 152-FZ.",
-            "evidence": evidence, "possible_fine": 150000}]
+            "description": (
+                f"В политике найдено только {sections_found} из {total} обязательных разделов. "
+                f"Отсутствуют: {', '.join(missing_sections)}. Согласно ст. 18.1 ФЗ-152 политика "
+                "должна содержать сведения о целях обработки, перечне ПДн, сроках хранения, правах субъектов, "
+                "мерах защиты и передаче третьим лицам."
+            ),
+            "recommendation": "Дополните политику недостающими разделами согласно требованиям ФЗ-152 «О персональных данных».",
+            "evidence": evidence, "possible_fine": 150000,
+        }]
 
     if policy_url:
-        return {"code": "privacy_policy", "title": "Privacy Policy",
-                "status": "warning", "details": "Minimal content", "evidence": evidence}, [{
-            "code": "minimal_privacy_policy", "title": "Minimal privacy policy",
+        return {
+            "code": "privacy_policy", "title": "152-ФЗ — Политика обработки персональных данных",
+            "status": "warning",
+            "details": f"Страница политики найдена, но содержание минимальное ({sections_found}/{total} разделов)",
+            "evidence": evidence,
+        }, [{
+            "code": "minimal_privacy_policy",
+            "title": "Политика обработки данных содержит минимум информации",
             "severity": "high", "category": "personal_data",
-            "description": "Key sections missing per 152-FZ.",
-            "recommendation": "Develop a full privacy policy.",
-            "evidence": evidence, "possible_fine": 300000}]
+            "description": (
+                f"Страница политики найдена, но раскрыто только {sections_found} из {total} обязательных разделов. "
+                f"Отсутствуют: {', '.join(missing_sections)}. Это нарушение ст. 18.1 ФЗ-152."
+            ),
+            "recommendation": "Разработайте полноценную политику обработки персональных данных с обязательными разделами.",
+            "evidence": evidence, "possible_fine": 300000,
+        }]
 
-    return {"code": "privacy_policy", "title": "Privacy Policy",
-            "status": "failed", "details": "Not found", "evidence": []}, [{
-        "code": "missing_privacy_policy", "title": "Missing privacy policy",
+    return {
+        "code": "privacy_policy", "title": "152-ФЗ — Политика обработки персональных данных",
+        "status": "failed",
+        "details": "Политика обработки персональных данных не найдена",
+        "evidence": evidence,
+    }, [{
+        "code": "missing_privacy_policy",
+        "title": "Отсутствует политика обработки персональных данных",
         "severity": "high", "category": "personal_data",
-        "description": "Violation of Art. 18.1 152-FZ.",
-        "recommendation": "Publish a privacy policy.", "evidence": [], "possible_fine": 300000}]
+        "description": (
+            "На сайте не найдена политика обработки персональных данных. "
+            "Это прямое нарушение ст. 18.1 ФЗ-152 «О персональных данных». "
+            "Документ обязателен для любого сайта, который собирает любые персональные данные пользователей."
+        ),
+        "recommendation": (
+            "Разместите политику обработки персональных данных. Документ должен быть доступен по прямой ссылке "
+            "с любой страницы сайта (обычно в футере) и содержать: цели обработки, перечень данных, сроки хранения, "
+            "права субъектов, меры защиты, информацию о передаче третьим лицам."
+        ),
+        "evidence": evidence, "possible_fine": 300000,
+    }]
 
 
-# -- 3. User Agreement --
+# ============================================================================
+# 3. 152-ФЗ — Согласие на обработку данных в формах
+# ============================================================================
 
-def check_user_agreement(pages_html: dict, links: List[str]) -> Tuple[dict, list]:
-    all_text = _all_text(pages_html)
-    keywords = ["user agreement", "terms of use", "terms of service", "terms and conditions"]
+CONSENT_KW = [
+    "согласие на обработку", "согласен на обработку", "согласна на обработку",
+    "обработку персональных данных", "политику конфиденциальности",
+    "политикой конфиденциальности", "пользовательским соглашением",
+    "consent to processing", "i consent", "i agree", "privacy policy",
+]
+PERSONAL_INPUT_TYPES = {"email", "tel", "phone", "number"}
+PERSONAL_INPUT_NAMES = [
+    "email", "phone", "tel", "name", "fio", "firstname", "lastname",
+    "username", "имя", "фио", "телефон", "почта",
+]
 
-    found_url = None
-    for url in pages_html:
-        if any(kw in url.lower() for kw in ["agreement", "terms", "conditions"]):
-            found_url = url; break
-    if not found_url:
-        for link in links:
-            if any(kw in link.lower() for kw in ["agreement", "terms", "conditions"]):
-                found_url = link; break
-
-    if found_url:
-        return {"code": "user_agreement", "title": "User Agreement",
-                "status": "passed", "details": f"Found: {found_url}", "evidence": [found_url]}, []
-
-    if any(kw in all_text for kw in keywords):
-        return {"code": "user_agreement", "title": "User Agreement",
-                "status": "warning", "details": "Mentioned, no dedicated page", "evidence": []}, [{
-            "code": "no_user_agreement_page", "title": "No dedicated agreement page",
-            "severity": "low", "category": "user_agreement",
-            "description": "Harder to access.",
-            "recommendation": "Create a dedicated page.", "evidence": [], "possible_fine": None}]
-
-    return {"code": "user_agreement", "title": "User Agreement",
-            "status": "warning", "details": "Not found", "evidence": []}, [{
-        "code": "missing_user_agreement", "title": "Missing user agreement",
-        "severity": "medium", "category": "user_agreement",
-        "description": "Required for sites with registration/payments.",
-        "recommendation": "Create and publish.", "evidence": [], "possible_fine": 50000}]
-
-
-# -- 4. Form Consent --
 
 def check_form_consent(pages_html: dict) -> Tuple[dict, list]:
-    consent_kw = ["consent to processing", "agree to processing", "i consent",
-                  "personal data", "privacy policy", "i agree", "accept terms"]
-    personal_types = {"email", "tel", "phone", "number"}
-    personal_names = ["email", "phone", "tel", "name", "fio", "firstname", "lastname", "username"]
-
-    forms_found = 0
-    consent_found = 0
-    has_checkbox = False
+    forms_total = 0
+    forms_with_consent = 0
+    forms_with_checkbox = 0
     evidence = []
 
     for url, html in pages_html.items():
@@ -293,469 +393,76 @@ def check_form_consent(pages_html: dict) -> Tuple[dict, list]:
             for inp in inputs:
                 itype = (inp.get("type") or "").lower()
                 iname = (inp.get("name") or inp.get("id") or inp.get("placeholder") or "").lower()
-                if itype in personal_types or any(n in iname for n in personal_names):
-                    has_personal = True; break
+                if itype in PERSONAL_INPUT_TYPES or any(n in iname for n in PERSONAL_INPUT_NAMES):
+                    has_personal = True
+                    break
             if not has_personal:
                 continue
 
-            forms_found += 1
+            forms_total += 1
             form_text = form.get_text(" ", strip=True).lower()
-
-            for cb in form.find_all("input", type="checkbox"):
-                cb_name = (cb.get("name") or "").lower()
-                parent_text = (cb.parent.get_text(" ", strip=True).lower() if cb.parent else "")
-                if any(kw in (cb_name + " " + parent_text) for kw in consent_kw):
-                    has_checkbox = True; break
-
             parent_text = (form.parent.get_text(" ", strip=True).lower() if form.parent else "")
             combined = form_text + " " + parent_text
-            if any(kw in combined for kw in consent_kw):
-                consent_found += 1
-                evidence.append(f"Form at {url}: consent found")
+
+            checkbox_consent = False
+            for cb in form.find_all("input", type="checkbox"):
+                cb_name = (cb.get("name") or "").lower()
+                cb_parent = (cb.parent.get_text(" ", strip=True).lower() if cb.parent else "")
+                if any(kw in (cb_name + " " + cb_parent) for kw in CONSENT_KW):
+                    checkbox_consent = True
+                    break
+            if checkbox_consent:
+                forms_with_checkbox += 1
+
+            if any(kw in combined for kw in CONSENT_KW) or checkbox_consent:
+                forms_with_consent += 1
+                evidence.append(f"Форма на {url}: согласие найдено" + (" (чекбокс)" if checkbox_consent else ""))
             else:
-                evidence.append(f"Form at {url}: consent MISSING")
+                evidence.append(f"Форма на {url}: согласие НЕ найдено")
 
-    if forms_found == 0:
-        return {"code": "form_consent", "title": "Form Consent", "status": "passed",
-                "details": "No personal data forms found", "evidence": []}, []
+    if forms_total == 0:
+        return {
+            "code": "form_consent", "title": "152-ФЗ — Согласие на обработку данных в формах",
+            "status": "passed",
+            "details": "Формы сбора персональных данных не обнаружены",
+            "evidence": [],
+        }, []
 
-    if consent_found >= forms_found:
-        extra = ", has checkbox" if has_checkbox else ""
-        return {"code": "form_consent", "title": "Form Consent", "status": "passed",
-                "details": f"All {forms_found} forms have consent{extra}", "evidence": evidence}, []
+    if forms_with_consent >= forms_total:
+        extra = f", в том числе {forms_with_checkbox} с чекбоксом" if forms_with_checkbox else ""
+        return {
+            "code": "form_consent", "title": "152-ФЗ — Согласие на обработку данных в формах",
+            "status": "passed",
+            "details": f"Во всех {forms_total} формах с персональными данными найдено согласие{extra}",
+            "evidence": evidence,
+        }, []
 
-    missing = forms_found - consent_found
-    return {"code": "form_consent", "title": "Form Consent",
-            "status": "failed" if missing == forms_found else "warning",
-            "details": f"{missing}/{forms_found} forms lack consent", "evidence": evidence}, [{
-        "code": "missing_form_consent", "title": "Missing form consent",
+    missing = forms_total - forms_with_consent
+    status = "failed" if missing == forms_total else "warning"
+    return {
+        "code": "form_consent", "title": "152-ФЗ — Согласие на обработку данных в формах",
+        "status": status,
+        "details": f"В {missing} из {forms_total} форм не найдено согласие на обработку персональных данных",
+        "evidence": evidence,
+    }, [{
+        "code": "missing_form_consent",
+        "title": "Не получается согласие на обработку ПДн в формах",
         "severity": "high", "category": "personal_data",
-        "description": f"{missing} forms lack consent. Violation of Art. 9 152-FZ.",
-        "recommendation": "Add consent checkbox with link to privacy policy.",
-        "evidence": evidence, "possible_fine": 150000}]
-
-
-# -- 5. Cookie Banner --
-
-def check_cookie_banner(pages_html: dict) -> Tuple[dict, list]:
-    cookie_kw = ["cookie", "cookies"]
-    accept_kw = ["accept", "agree", "ok", "got it", "understood"]
-    reject_kw = ["reject", "decline", "settings", "customize", "preferences"]
-
-    for url, html in pages_html.items():
-        text_lower = html.lower()
-        if not any(kw in text_lower for kw in cookie_kw):
-            continue
-        has_accept = any(kw in text_lower for kw in accept_kw)
-        has_reject = any(kw in text_lower for kw in reject_kw)
-
-        if has_accept and has_reject:
-            return {"code": "cookie_banner", "title": "Cookie Banner", "status": "passed",
-                    "details": "Banner with accept/reject", "evidence": [url]}, []
-        if has_accept:
-            return {"code": "cookie_banner", "title": "Cookie Banner", "status": "warning",
-                    "details": "Banner without reject option", "evidence": [url]}, [{
-                "code": "cookie_no_reject", "title": "No reject button",
-                "severity": "low", "category": "cookies",
-                "description": "Banner lacks explicit reject.",
-                "recommendation": "Add reject button.", "evidence": [url], "possible_fine": None}]
-        return {"code": "cookie_banner", "title": "Cookie Banner", "status": "warning",
-                "details": "Cookie mention without banner", "evidence": [url]}, [{
-            "code": "cookie_no_banner", "title": "No explicit banner",
-            "severity": "low", "category": "cookies",
-            "description": "Cookies mentioned without banner.",
-            "recommendation": "Add cookie banner.", "evidence": [url], "possible_fine": None}]
-
-    return {"code": "cookie_banner", "title": "Cookie Banner", "status": "warning",
-            "details": "Not found", "evidence": []}, [{
-        "code": "missing_cookie_banner", "title": "Missing cookie notice",
-        "severity": "medium", "category": "cookies",
-        "description": "Recommended to inform about cookies.",
-        "recommendation": "Add cookie banner.", "evidence": [], "possible_fine": 60000}]
-
-
-# -- 6. Advertising Marking --
-
-def check_advertising_marking(pages_html: dict) -> Tuple[dict, list]:
-    erid_pat = re.compile(r"erid\s*[:=]?\s*[a-zA-Z0-9]{8,}", re.IGNORECASE)
-    ad_label_pat = re.compile(r"advertisement\b|ad\b", re.IGNORECASE)
-    token_pat = re.compile(r"token\s*(ad)?\s*[:=]?\s*[a-zA-Z0-9]{8,}", re.IGNORECASE)
-
-    has_ads = False; has_erid = False; evidence = []
-
-    for url, html in pages_html.items():
-        if ad_label_pat.search(html):
-            has_ads = True; evidence.append(f"Ad label on {url}")
-        if erid_pat.search(html) or token_pat.search(html):
-            has_erid = True; evidence.append(f"ERID on {url}")
-
-    if not has_ads:
-        return {"code": "advertising_marking", "title": "Ad Marking (ERID)",
-                "status": "passed", "details": "No ads detected", "evidence": []}, []
-
-    if has_erid:
-        return {"code": "advertising_marking", "title": "Ad Marking (ERID)",
-                "status": "passed", "details": "ERID present", "evidence": evidence}, []
-
-    return {"code": "advertising_marking", "title": "Ad Marking (ERID)",
-            "status": "failed", "details": "Ads without ERID", "evidence": evidence}, [{
-        "code": "missing_erid", "title": "Missing ERID marking",
-        "severity": "high", "category": "ads",
-        "description": "Ads detected without ERID token. Violation of 347-FZ.",
-        "recommendation": "Register with ORD and get ERID tokens.",
-        "evidence": evidence, "possible_fine": 500000}]
-
-
-# -- 7. Company Requisites --
-
-def check_company_requisites(pages_html: dict) -> Tuple[dict, list]:
-    inn_pat = re.compile(r"\bINN\s*:?\s*\d{10,12}\b", re.IGNORECASE)
-    ogrn_pat = re.compile(r"\b(OGRN|OGRNIP)\s*:?\s*\d{13,15}\b", re.IGNORECASE)
-    kpp_pat = re.compile(r"\bKPP\s*:?\s*\d{9}\b", re.IGNORECASE)
-    phone_pat = re.compile(r"(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
-    email_pat = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-    address_pat = re.compile(r"(legal|physical|postal)\s*address", re.IGNORECASE)
-    director_pat = re.compile(r"(general\s*director|director|CEO|head)\s*[:.]?\s*\S", re.IGNORECASE)
-
-    found = {"inn": False, "ogrn": False, "kpp": False, "phone": False,
-             "email": False, "address": False, "director": False}
-    evidence = []
-
-    for url, html in pages_html.items():
-        soup = BeautifulSoup(html, "lxml")
-        text = soup.get_text(" ", strip=True)
-
-        if inn_pat.search(text) and not found["inn"]:
-            found["inn"] = True; evidence.append("INN found")
-        if ogrn_pat.search(text) and not found["ogrn"]:
-            found["ogrn"] = True; evidence.append("OGRN found")
-        if kpp_pat.search(text) and not found["kpp"]:
-            found["kpp"] = True; evidence.append("KPP found")
-        if phone_pat.search(text) and not found["phone"]:
-            found["phone"] = True; evidence.append("Phone found")
-        if email_pat.search(text) and not found["email"]:
-            found["email"] = True; evidence.append("Email found")
-        if address_pat.search(text) and not found["address"]:
-            found["address"] = True; evidence.append("Address found")
-        if director_pat.search(text) and not found["director"]:
-            found["director"] = True; evidence.append("Director found")
-
-    score = sum(found.values())
-
-    if score >= 5:
-        return {"code": "company_requisites", "title": "Company Requisites",
-                "status": "passed", "details": f"Found ({score}/7)", "evidence": evidence}, []
-
-    if score >= 3:
-        missing_items = [k for k, v in found.items() if not v]
-        return {"code": "company_requisites", "title": "Company Requisites",
-                "status": "warning", "details": f"Partial ({score}/7). Missing: {', '.join(missing_items)}",
-                "evidence": evidence}, [{
-            "code": "incomplete_requisites", "title": "Incomplete requisites",
-            "severity": "medium", "category": "company_info",
-            "description": f"Missing: {', '.join(missing_items)}.",
-            "recommendation": "Add missing company details.",
-            "evidence": evidence, "possible_fine": 50000}]
-
-    if score >= 1:
-        return {"code": "company_requisites", "title": "Company Requisites",
-                "status": "warning", "details": f"Minimal ({score}/7)", "evidence": evidence}, [{
-            "code": "minimal_requisites", "title": "Minimal requisites",
-            "severity": "high", "category": "company_info",
-            "description": f"Only {score}/7 found.",
-            "recommendation": "Add full company details.",
-            "evidence": evidence, "possible_fine": 100000}]
-
-    return {"code": "company_requisites", "title": "Company Requisites",
-            "status": "failed", "details": "Not found", "evidence": []}, [{
-        "code": "missing_requisites", "title": "Missing requisites",
-        "severity": "high", "category": "company_info",
-        "description": "No company details found.",
-        "recommendation": "Create a requisites page.", "evidence": [], "possible_fine": 100000}]
-
-
-# -- 8. Consumer Rights --
-
-def check_consumer_rights(pages_html: dict, links: List[str]) -> Tuple[dict, list]:
-    all_text = _all_text(pages_html)
-    for link in links:
-        all_text += " " + link.lower()
-
-    docs = {
-        "offer/contract": ["offer", "contract", "public offer"],
-        "returns/exchange": ["return", "exchange", "refund", "returns policy"],
-        "delivery": ["delivery", "shipping", "delivery method"],
-        "payment": ["payment", "payment method", "price"],
-        "warranty": ["warranty", "guarantee", "warranty period"],
-    }
-
-    found = {}
-    evidence = []
-    for doc, keywords in docs.items():
-        found[doc] = any(kw in all_text for kw in keywords)
-        if found[doc]:
-            evidence.append(f"Found: {doc}")
-
-    found_count = sum(found.values())
-
-    if found_count >= 4:
-        return {"code": "consumer_rights", "title": "Consumer Documents",
-                "status": "passed", "details": f"Found ({found_count}/5)", "evidence": evidence}, []
-
-    missing = [k for k, v in found.items() if not v]
-
-    if found_count >= 2:
-        return {"code": "consumer_rights", "title": "Consumer Documents",
-                "status": "warning", "details": f"Missing: {', '.join(missing)}", "evidence": evidence}, [{
-            "code": "missing_consumer_docs", "title": f"Missing: {', '.join(missing)}",
-            "severity": "medium", "category": "consumer_rights",
-            "description": f"Missing documents: {', '.join(missing)}.",
-            "recommendation": f"Add pages for: {', '.join(missing)}.",
-            "evidence": evidence, "possible_fine": 50000}]
-
-    return {"code": "consumer_rights", "title": "Consumer Documents",
-            "status": "failed", "details": f"Most missing ({found_count}/5)", "evidence": evidence}, [{
-        "code": "missing_consumer_docs_critical", "title": "Critical lack of consumer docs",
-        "severity": "high", "category": "consumer_rights",
-        "description": f"Only {found_count}/5 documents found.",
-        "recommendation": "Add all required consumer documents urgently.",
-        "evidence": evidence, "possible_fine": 100000}]
-# -- 9. Age Marking (18+) --
-
-def check_age_marking(pages_html: dict) -> Tuple[dict, list]:
-    age_patterns = [
-        re.compile(r"18\+", re.IGNORECASE),
-        re.compile(r"adult\s*content", re.IGNORECASE),
-        re.compile(r"age\s*restriction", re.IGNORECASE),
-    ]
-    adult_kw = ["casino", "betting", "bookmaker", "alcohol", "tobacco", "vape",
-                "adult content", "18+", "erotic", "porn"]
-
-    all_text = _all_text(pages_html)
-    all_html = _all_html(pages_html)
-
-    has_adult = any(kw in all_text for kw in adult_kw)
-    has_age_mark = any(p.search(all_html) for p in age_patterns)
-
-    if not has_adult:
-        return {"code": "age_marking", "title": "Age Marking (18+)",
-                "status": "passed", "details": "No adult content", "evidence": []}, []
-
-    if has_age_mark:
-        return {"code": "age_marking", "title": "Age Marking (18+)",
-                "status": "passed", "details": "Age marking present", "evidence": ["18+ marking found"]}, []
-
-    return {"code": "age_marking", "title": "Age Marking (18+)",
-            "status": "failed", "details": "Adult content without marking", "evidence": []}, [{
-        "code": "missing_age_marking", "title": "Missing 18+ marking",
-        "severity": "high", "category": "age_marking",
-        "description": "Adult content without age marking. Violation of 436-FZ.",
-        "recommendation": "Add 18+ marking.", "evidence": [], "possible_fine": 50000}]
-
-
-# -- 10. Copyright --
-
-def check_copyright(pages_html: dict) -> Tuple[dict, list]:
-    patterns = [
-        re.compile(r"\u00a9\s*\d{4}", re.IGNORECASE),
-        re.compile(r"copyright\s*\d{4}", re.IGNORECASE),
-        re.compile(r"all\s*rights\s*reserved", re.IGNORECASE),
-    ]
-    all_html = _all_html(pages_html)
-    found = any(p.search(all_html) for p in patterns)
-
-    if found:
-        return {"code": "copyright", "title": "Copyright", "status": "passed",
-                "details": "Copyright found", "evidence": ["Copyright present"]}, []
-
-    return {"code": "copyright", "title": "Copyright", "status": "warning",
-            "details": "Not found", "evidence": []}, [{
-        "code": "missing_copyright", "title": "Missing copyright",
-        "severity": "low", "category": "copyright",
-        "description": "No copyright notice.",
-        "recommendation": "Add copyright in footer.", "evidence": [], "possible_fine": None}]
-
-
-# -- 11. Contacts --
-
-def check_contacts(pages_html: dict) -> Tuple[dict, list]:
-    phone_pat = re.compile(r"(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
-    email_pat = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-    address_hint = re.compile(r"(address|location|office|store)", re.IGNORECASE)
-    schedule_pat = re.compile(r"(working hours|schedule|mon|tue|wed|thu|fri|sat|sun|daily)", re.IGNORECASE)
-    map_pat = re.compile(r"(map|google\.maps|yandex\.maps|2gis)", re.IGNORECASE)
-
-    found = {"phone": False, "email": False, "address": False, "schedule": False, "map": False}
-    evidence = []
-
-    for url, html in pages_html.items():
-        soup = BeautifulSoup(html, "lxml")
-        text = soup.get_text(" ", strip=True)
-
-        if phone_pat.search(text) and not found["phone"]:
-            found["phone"] = True; evidence.append("Phone found")
-        if email_pat.search(text) and not found["email"]:
-            found["email"] = True; evidence.append("Email found")
-        if address_hint.search(text) and not found["address"]:
-            found["address"] = True; evidence.append("Address found")
-        if schedule_pat.search(text) and not found["schedule"]:
-            found["schedule"] = True; evidence.append("Schedule found")
-        if map_pat.search(text) and not found["map"]:
-            found["map"] = True; evidence.append("Map found")
-
-    score = sum(found.values())
-
-    if score >= 4:
-        return {"code": "contacts", "title": "Contact Info", "status": "passed",
-                "details": f"Found ({score}/5)", "evidence": evidence}, []
-
-    if score >= 2:
-        missing = [k for k, v in found.items() if not v]
-        return {"code": "contacts", "title": "Contact Info", "status": "warning",
-                "details": f"Partial ({score}/5). Missing: {', '.join(missing)}", "evidence": evidence}, [{
-            "code": "incomplete_contacts", "title": "Incomplete contacts",
-            "severity": "medium", "category": "contacts",
-            "description": f"Missing: {', '.join(missing)}.",
-            "recommendation": "Add missing contact info.", "evidence": evidence, "possible_fine": 30000}]
-
-    return {"code": "contacts", "title": "Contact Info", "status": "failed",
-            "details": "Almost no contacts", "evidence": evidence}, [{
-        "code": "missing_contacts", "title": "Missing contacts",
-        "severity": "high", "category": "contacts",
-        "description": "No contact information found.",
-        "recommendation": "Add phone, email, address.", "evidence": [], "possible_fine": 50000}]
-
-
-# -- 12. Payment Security --
-
-def check_payment_security(pages_html: dict) -> Tuple[dict, list]:
-    payment_kw = ["card payment", "pay", "checkout", "cart", "mastercard", "visa", "mir",
-                  "stripe", "paypal", "yookassa", "robokassa"]
-    security_kw = ["secure payment", "payment security", "ssl", "pci dss",
-                   "3d secure", "encryption", "data protected"]
-
-    all_text = _all_text(pages_html)
-    has_payment = any(kw in all_text for kw in payment_kw)
-    has_security = any(kw in all_text for kw in security_kw)
-
-    if not has_payment:
-        return {"code": "payment_security", "title": "Payment Security",
-                "status": "passed", "details": "No payment forms", "evidence": []}, []
-
-    if has_security:
-        return {"code": "payment_security", "title": "Payment Security",
-                "status": "passed", "details": "Security info present", "evidence": ["Security mention found"]}, []
-
-    return {"code": "payment_security", "title": "Payment Security",
-            "status": "warning", "details": "Payments without security info", "evidence": []}, [{
-        "code": "no_payment_security_info", "title": "No payment security info",
-        "severity": "medium", "category": "payment_security",
-        "description": "Site accepts payments without security disclosure.",
-        "recommendation": "Add SSL, PCI DSS, 3D Secure info.", "evidence": [], "possible_fine": None}]
-
-
-# -- 13. Technical --
-
-def check_technical(main_html: str, final_url: str, robots_ok: bool, sitemap_ok: bool) -> Tuple[List[dict], list]:
-    checks = []
-    issues = []
-    soup = BeautifulSoup(main_html, "lxml")
-
-    # Title
-    title_tag = soup.find("title")
-    title_text = title_tag.get_text(strip=True) if title_tag else ""
-    has_title = bool(title_text)
-    title_len = len(title_text)
-    title_ok = has_title and 10 <= title_len <= 120
-
-    if title_ok:
-        checks.append({"code": "meta_title", "title": "<title>", "status": "passed",
-                       "details": f"Title: {title_text[:80]}", "evidence": []})
-    elif has_title:
-        checks.append({"code": "meta_title", "title": "<title>", "status": "warning",
-                       "details": f"Too short ({title_len} chars)", "evidence": []})
-        issues.append({"code": "short_title", "title": "Short <title>", "severity": "low",
-                       "category": "technical", "description": f"Title: {title_len} chars.",
-                       "recommendation": "Use 30-60 chars.", "evidence": [], "possible_fine": None})
-    else:
-        checks.append({"code": "meta_title", "title": "<title>", "status": "failed",
-                       "details": "Missing", "evidence": []})
-        issues.append({"code": "missing_title", "title": "Missing <title>", "severity": "medium",
-                       "category": "technical", "description": "Critical for SEO.",
-                       "recommendation": "Add <title>.", "evidence": [], "possible_fine": None})
-
-    # Meta description
-    meta_desc = soup.find("meta", attrs={"name": "description"})
-    desc_content = (meta_desc.get("content", "").strip()) if meta_desc else ""
-    has_meta = bool(desc_content)
-    desc_len = len(desc_content)
-    desc_ok = has_meta and 50 <= desc_len <= 300
-    checks.append({"code": "meta_description", "title": "Meta description",
-                   "status": "passed" if desc_ok else "warning",
-                   "details": f"Description ({desc_len} chars)" if has_meta else "Missing", "evidence": []})
-
-    # Viewport
-    viewport = soup.find("meta", attrs={"name": "viewport"})
-    has_viewport = bool(viewport and viewport.get("content", ""))
-    checks.append({"code": "viewport", "title": "Viewport (mobile)",
-                   "status": "passed" if has_viewport else "warning",
-                   "details": "Present" if has_viewport else "Missing - may not be mobile-friendly", "evidence": []})
-
-    # Favicon
-    favicon = soup.find("link", rel=lambda r: r and "icon" in r) or soup.find("link", href=lambda h: h and "favicon" in h)
-    checks.append({"code": "favicon", "title": "Favicon",
-                   "status": "passed" if favicon else "warning",
-                   "details": "Found" if favicon else "Not found", "evidence": []})
-
-    # Charset
-    charset = soup.find("meta", attrs={"charset": True}) or soup.find("meta", attrs={"http-equiv": lambda v: v and "content-type" in v.lower()})
-    checks.append({"code": "charset", "title": "Charset",
-                   "status": "passed" if charset else "warning",
-                   "details": "Specified" if charset else "Not specified", "evidence": []})
-
-    # H1
-    h1_tags = soup.find_all("h1")
-    if len(h1_tags) == 1:
-        checks.append({"code": "h1", "title": "H1 heading", "status": "passed",
-                       "details": f"H1: {h1_tags[0].get_text(strip=True)[:80]}", "evidence": []})
-    elif len(h1_tags) > 1:
-        checks.append({"code": "h1", "title": "H1 heading", "status": "warning",
-                       "details": f"Multiple H1 ({len(h1_tags)})", "evidence": []})
-    else:
-        checks.append({"code": "h1", "title": "H1 heading", "status": "warning",
-                       "details": "Missing", "evidence": []})
-
-    # Open Graph
-    og_title = soup.find("meta", property="og:title")
-    og_desc = soup.find("meta", property="og:description")
-    og_image = soup.find("meta", property="og:image")
-    og_count = sum(1 for t in [og_title, og_desc, og_image] if t and t.get("content", "").strip())
-    checks.append({"code": "open_graph", "title": "Open Graph",
-                   "status": "passed" if og_count >= 2 else "warning",
-                   "details": f"OG tags: {og_count}/3" if og_count > 0 else "No OG tags", "evidence": []})
-
-    # Images alt
-    images = soup.find_all("img")
-    images_with_alt = sum(1 for img in images if img.get("alt"))
-    alt_ratio = images_with_alt / len(images) if images else 1.0
-    checks.append({"code": "img_alt", "title": "Image alt attributes",
-                   "status": "passed" if alt_ratio >= 0.7 else "warning",
-                   "details": f"Alt on {images_with_alt}/{len(images)} images" if images else "No images", "evidence": []})
-
-    # Robots.txt
-    checks.append({"code": "robots_txt", "title": "robots.txt",
-                   "status": "passed" if robots_ok else "warning",
-                   "details": "Available" if robots_ok else "Not available", "evidence": []})
-
-    # Sitemap
-    checks.append({"code": "sitemap_xml", "title": "sitemap.xml",
-                   "status": "passed" if sitemap_ok else "warning",
-                   "details": "Available" if sitemap_ok else "Not available", "evidence": []})
-
-    return checks, issues
-
-
-# -- 14. Server Location (152-FZ localization) --
+        "description": (
+            f"В {missing} из {forms_total} форм с персональными данными отсутствует чекбокс или текст согласия. "
+            "Это нарушение ст. 9 ФЗ-152: обработка персональных данных без согласия субъекта недопустима."
+        ),
+        "recommendation": (
+            "Добавьте в каждую форму чекбокс «Я согласен на обработку персональных данных» со ссылкой "
+            "на политику конфиденциальности. Без отметки чекбокса кнопка отправки должна быть неактивна."
+        ),
+        "evidence": evidence, "possible_fine": 150000,
+    }]
+
+
+# ============================================================================
+# 4. 152-ФЗ — Локализация серверов (ст. 18.5)
+# ============================================================================
 
 async def check_server_location(final_url: str, timeout: int = TIMEOUT) -> Tuple[dict, list]:
     parsed = urlparse(final_url)
@@ -767,25 +474,8 @@ async def check_server_location(final_url: str, timeout: int = TIMEOUT) -> Tuple
     except Exception:
         pass
 
-    hosting_hints = []
-    try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=timeout, verify=False) as client:
-            resp = await client.get(final_url)
-            headers_lower = {k.lower(): v for k, v in resp.headers.items()}
-            server_header = headers_lower.get("server", "")
-            powered_by = headers_lower.get("x-powered-by", "")
-
-            ru_hosting = ["nginx", "apache", "bitrix", "1c-bitrix", "umi", "netcat",
-                          "hostland", "reg.ru", "nic.ru", "beget", "timeweb", "sprinthost",
-                          "masterhost", "spaceweb", "majordomo", "jino", "ihc.ru"]
-            for h in ru_hosting:
-                if h in server_header.lower() or h in powered_by.lower():
-                    hosting_hints.append(f"Header: {server_header or powered_by}")
-                    break
-    except Exception:
-        pass
-
     geo_country = None
+    geo_country_full = None
     geo_org = None
     if server_ip:
         try:
@@ -793,165 +483,777 @@ async def check_server_location(final_url: str, timeout: int = TIMEOUT) -> Tuple
                 r = await client.get(f"http://ip-api.com/json/{server_ip}?fields=country,countryCode,org")
                 if r.status_code == 200:
                     data = r.json()
-                    geo_country = data.get("countryCode", "")
-                    geo_org = data.get("org", "")
+                    geo_country = data.get("countryCode")
+                    geo_country_full = data.get("country")
+                    geo_org = data.get("org")
         except Exception:
             pass
 
     evidence = []
     if server_ip:
-        evidence.append(f"Server IP: {server_ip}")
-    if geo_country:
-        evidence.append(f"Server country: {geo_country}")
+        evidence.append(f"IP-адрес сервера: {server_ip}")
+    if geo_country_full:
+        evidence.append(f"Страна расположения: {geo_country_full} ({geo_country})")
     if geo_org:
-        evidence.append(f"Provider: {geo_org}")
-    evidence.extend(hosting_hints)
+        evidence.append(f"Хостинг-провайдер: {geo_org}")
 
-    is_russian_ip = geo_country == "RU"
-
-    if is_russian_ip:
-        return {"code": "server_location", "title": "Server Localization (152-FZ)",
-                "status": "passed", "details": f"Server in Russia ({geo_country})", "evidence": evidence}, []
+    if geo_country == "RU":
+        return {
+            "code": "server_location", "title": "152-ФЗ — Локализация серверов (ст. 18.5)",
+            "status": "passed",
+            "details": f"Сервер расположен в России ({geo_country_full})",
+            "evidence": evidence,
+        }, []
 
     if server_ip and geo_country:
-        return {"code": "server_location", "title": "Server Localization (152-FZ)",
-                "status": "warning",
-                "details": f"Server outside RF ({geo_country}). Personal data of RF citizens must be stored in Russia per 152-FZ Art. 18.5.",
-                "evidence": evidence}, [{
-            "code": "server_not_in_russia", "title": "Server outside Russian Federation",
+        return {
+            "code": "server_location", "title": "152-ФЗ — Локализация серверов (ст. 18.5)",
+            "status": "warning",
+            "details": f"Сервер находится за пределами РФ (страна: {geo_country_full}). Это нарушение ст. 18.5 ФЗ-152",
+            "evidence": evidence,
+        }, [{
+            "code": "server_not_in_russia", "title": "Сервер расположен за пределами РФ",
             "severity": "high", "category": "personal_data",
-            "description": f"Server IP ({server_ip}) located in {geo_country}. Art. 18.5 of 152-FZ requires recording, systematization, accumulation, storage, clarification and extraction of personal data of RF citizens to be done using databases located in Russia.",
-            "recommendation": "Move servers/databases to Russia. Use Russian hosting providers (Selectel, DataLine, Rostelecom-DPC, etc.).",
-            "evidence": evidence, "possible_fine": 1000000}]
+            "description": (
+                f"IP-адрес сервера ({server_ip}) находится в стране {geo_country_full}. "
+                "Согласно ст. 18.5 ФЗ-152, запись, систематизация, накопление, хранение, уточнение и извлечение "
+                "персональных данных граждан РФ должны осуществляться с использованием баз данных, "
+                "находящихся на территории Российской Федерации."
+            ),
+            "recommendation": (
+                "Перенесите серверы и базу данных с персональными данными в Россию. "
+                "Используйте российских хостинг-провайдеров (Selectel, Timeweb, REG.RU, Beget, Yandex Cloud, VK Cloud)."
+            ),
+            "evidence": evidence, "possible_fine": 6000000,
+        }]
 
-    return {"code": "server_location", "title": "Server Localization (152-FZ)",
-            "status": "warning", "details": "Could not determine server location. Verify manually.",
-            "evidence": evidence}, [{
-        "code": "server_location_unknown", "title": "Server location unknown",
+    return {
+        "code": "server_location", "title": "152-ФЗ — Локализация серверов (ст. 18.5)",
+        "status": "warning",
+        "details": "Не удалось определить местоположение сервера. Требуется ручная проверка",
+        "evidence": evidence,
+    }, [{
+        "code": "server_location_unknown", "title": "Не удалось определить страну сервера",
         "severity": "medium", "category": "personal_data",
-        "description": "Could not determine server country. Verify manually for 152-FZ compliance.",
-        "recommendation": "Check server geolocation via whois. Ensure hosting in Russia.",
-        "evidence": evidence, "possible_fine": 1000000}]
+        "description": (
+            "Не удалось автоматически определить страну, в которой расположен сервер сайта. "
+            "Согласно ст. 18.5 ФЗ-152, базы данных с ПДн граждан РФ должны находиться в России. "
+            "Требуется ручная проверка."
+        ),
+        "recommendation": "Проверьте местоположение сервера через whois IP. Убедитесь, что хостинг находится в РФ.",
+        "evidence": evidence, "possible_fine": None,
+    }]
 
 
-# -- 15. RKN Notification (Personal Data Operator Registry) --
+# ============================================================================
+# 5. 152-ФЗ — Уведомление РКН (ст. 22)
+# ============================================================================
+
+RKN_KW = [
+    "роскомнадзор", "rkn", "rkn.gov", "pd.rkn.gov",
+    "реестр операторов", "реестр оператор", "оператор персональных данных",
+    "оператор по обработке персональных данных", "уведомление об обработке",
+    "уведомили роскомнадзор", "регистрационный номер оператора",
+    "номер в реестре",
+]
+
 
 def check_rkn_notification(pages_html: dict) -> Tuple[dict, list]:
     all_text = _all_text(pages_html)
-    rkn_kw = ["roskomnadzor", "rkn", "notification to roskomnadzor",
-              "personal data operator registry", "personal data operator",
-              "processing notification", "registered in registry",
-              "operator registration number", "rkn registry number"]
-
-    found = [kw for kw in rkn_kw if kw in all_text]
+    found = [kw for kw in RKN_KW if kw in all_text]
 
     if found:
-        return {"code": "rkn_notification", "title": "RKN Notification (152-FZ Art. 22)",
-                "status": "passed", "details": "RKN registration mention found", "evidence": found[:3]}, []
+        return {
+            "code": "rkn_notification", "title": "152-ФЗ — Уведомление Роскомнадзора (ст. 22)",
+            "status": "passed",
+            "details": "На сайте найдено упоминание о регистрации в реестре операторов ПДн",
+            "evidence": [f"Найдено: {kw}" for kw in found[:3]],
+        }, []
 
-    return {"code": "rkn_notification", "title": "RKN Notification (152-FZ Art. 22)",
-            "status": "warning", "details": "No RKN registration info found", "evidence": []}, [{
-        "code": "no_rkn_notification", "title": "No Roskomnadzor notification info",
+    return {
+        "code": "rkn_notification", "title": "152-ФЗ — Уведомление Роскомнадзора (ст. 22)",
+        "status": "warning",
+        "details": "На сайте не найдено упоминание о регистрации оператора ПДн в реестре Роскомнадзора",
+        "evidence": [],
+    }, [{
+        "code": "no_rkn_notification",
+        "title": "Нет упоминания об уведомлении Роскомнадзора",
         "severity": "high", "category": "personal_data",
-        "description": "Per Art. 22 of 152-FZ, personal data operators must notify Roskomnadzor before processing begins. Absence of this info on site may indicate violation.",
-        "recommendation": "Submit notification to RKN via pd.rkn.gov.ru and publish registration info on site.",
-        "evidence": [], "possible_fine": 300000}]
+        "description": (
+            "Согласно ст. 22 ФЗ-152, оператор персональных данных обязан уведомить Роскомнадзор "
+            "о намерении осуществлять обработку ПДн до начала такой обработки. "
+            "На сайте не найдено упоминаний о подаче такого уведомления."
+        ),
+        "recommendation": (
+            "Подайте уведомление через pd.rkn.gov.ru, получите регистрационный номер в реестре "
+            "операторов и укажите его в политике обработки персональных данных."
+        ),
+        "evidence": [], "possible_fine": 300000,
+    }]
 
 
-# -- 16. Full Age Marking (436-FZ) --
+# ============================================================================
+# 6. Cookie-баннер
+# ============================================================================
 
-def check_age_marking_full(pages_html: dict) -> Tuple[dict, list]:
-    all_html = _all_html(pages_html)
-    age_patterns = {
-        "0+": re.compile(r"0\+|\(0\+\)|РґР»СЏ Р»СЋР±РѕР№ Р°СѓРґРёС‚РѕСЂРёРё|Р±РµР· РѕРіСЂР°РЅРёС‡РµРЅРёР№", re.IGNORECASE),
-        "6+": re.compile(r"6\+|\(6\+\)|РґР»СЏ РґРµС‚РµР№ СЃС‚Р°СЂС€Рµ 6", re.IGNORECASE),
-        "12+": re.compile(r"12\+|\(12\+\)|РґР»СЏ РґРµС‚РµР№ СЃС‚Р°СЂС€Рµ 12", re.IGNORECASE),
-        "16+": re.compile(r"16\+|\(16\+\)|РґР»СЏ РґРµС‚РµР№ СЃС‚Р°СЂС€Рµ 16", re.IGNORECASE),
-        "18+": re.compile(r"18\+|\(18\+\)|РґР»СЏ РІР·СЂРѕСЃР»С‹С…|Р·Р°РїСЂРµС‰РµРЅРѕ РґР»СЏ РґРµС‚РµР№", re.IGNORECASE),
-    }
+COOKIE_KW = ["cookie", "cookies", "куки", "файлы cookie", "файлами cookie"]
+COOKIE_ACCEPT_KW = [
+    "принять", "принимаю", "согласен", "хорошо", "понятно", "ок ",
+    "accept", "agree", "ok ", "got it", "understood",
+]
+COOKIE_REJECT_KW = [
+    "отклонить", "отказаться", "отказ", "настройки", "настроить",
+    "reject", "decline", "settings", "customize", "preferences",
+]
 
-    found_any = False
+
+def check_cookie_banner(pages_html: dict) -> Tuple[dict, list]:
+    for url, html in pages_html.items():
+        text_lower = html.lower()
+        if not any(kw in text_lower for kw in COOKIE_KW):
+            continue
+        has_accept = any(kw in text_lower for kw in COOKIE_ACCEPT_KW)
+        has_reject = any(kw in text_lower for kw in COOKIE_REJECT_KW)
+
+        if has_accept and has_reject:
+            return {
+                "code": "cookie_banner", "title": "Cookie-баннер",
+                "status": "passed",
+                "details": "Баннер с кнопками принять/отклонить найден",
+                "evidence": [url],
+            }, []
+
+        if has_accept:
+            return {
+                "code": "cookie_banner", "title": "Cookie-баннер",
+                "status": "warning",
+                "details": "Баннер найден, но кнопки отказа нет",
+                "evidence": [url],
+            }, [{
+                "code": "cookie_no_reject", "title": "В cookie-баннере нет кнопки отказа",
+                "severity": "low", "category": "cookies",
+                "description": (
+                    "Cookie-баннер найден, но в нём нет явной кнопки «Отклонить» или «Настроить». "
+                    "Принцип GDPR/ФЗ-152: согласие должно быть свободно отзываемым, а отказ — таким же простым, как и принятие."
+                ),
+                "recommendation": "Добавьте в баннер кнопку «Отклонить» или «Настроить» рядом с кнопкой «Принять».",
+                "evidence": [url], "possible_fine": None,
+            }]
+
+        return {
+            "code": "cookie_banner", "title": "Cookie-баннер",
+            "status": "warning",
+            "details": "Упоминание cookie на странице найдено, но баннера с кнопками нет",
+            "evidence": [url],
+        }, [{
+            "code": "cookie_no_banner", "title": "Нет интерактивного cookie-баннера",
+            "severity": "low", "category": "cookies",
+            "description": "На странице есть упоминание cookie, но интерактивный баннер с кнопкой принятия не найден.",
+            "recommendation": "Добавьте всплывающий cookie-баннер с кнопками «Принять» и «Отклонить».",
+            "evidence": [url], "possible_fine": None,
+        }]
+
+    return {
+        "code": "cookie_banner", "title": "Cookie-баннер",
+        "status": "warning",
+        "details": "Cookie-баннер не найден",
+        "evidence": [],
+    }, [{
+        "code": "missing_cookie_banner", "title": "Отсутствует cookie-баннер",
+        "severity": "medium", "category": "cookies",
+        "description": (
+            "На сайте не найден баннер уведомления об использовании cookie. "
+            "Согласно практике РКН, посетитель должен быть проинформирован об использовании cookie "
+            "и иметь возможность отказаться от необязательных."
+        ),
+        "recommendation": "Добавьте cookie-баннер с информацией об использовании cookie и кнопками «Принять» / «Отклонить».",
+        "evidence": [], "possible_fine": 60000,
+    }]
+
+
+# ============================================================================
+# 7. 38-ФЗ — Маркировка рекламы (ERID)
+# ============================================================================
+
+ERID_PATTERN = re.compile(r"erid\s*[:=]?\s*[a-zA-Z0-9]{8,}", re.IGNORECASE)
+AD_LABEL_PATTERN = re.compile(r"\bреклама\b|\bна правах рекламы\b|\badvertisement\b", re.IGNORECASE)
+
+
+def check_advertising_marking(pages_html: dict) -> Tuple[dict, list]:
+    has_ads = False
+    has_erid = False
     evidence = []
-    for label, pat in age_patterns.items():
-        if pat.search(all_html):
-            found_any = True
-            evidence.append(f"Age marking {label} found")
 
-    if found_any:
-        return {"code": "age_marking_full", "title": "Age Marking (436-FZ)",
-                "status": "passed", "details": "Age marking present", "evidence": evidence}, []
+    for url, html in pages_html.items():
+        if AD_LABEL_PATTERN.search(html):
+            has_ads = True
+            evidence.append(f"Метка «Реклама» найдена на {url}")
+        if ERID_PATTERN.search(html):
+            has_erid = True
+            evidence.append(f"Токен ERID найден на {url}")
 
-    return {"code": "age_marking_full", "title": "Age Marking (436-FZ)",
-            "status": "warning", "details": "No age marking found. Required by 436-FZ for all public websites in Russia.",
-            "evidence": []}, [{
-        "code": "missing_age_marking_full", "title": "Missing age marking (436-FZ)",
-        "severity": "medium", "category": "age_marking",
-        "description": "Federal Law 436-FZ 'On Protection of Children from Harmful Information' requires all websites accessible in Russia to display age category marking (0+, 6+, 12+, 16+ or 18+).",
-        "recommendation": "Add age marking (e.g., '16+') in footer or header of every page.",
-        "evidence": [], "possible_fine": 50000}]
+    if not has_ads:
+        return {
+            "code": "advertising_marking", "title": "38-ФЗ — Маркировка рекламы (ERID)",
+            "status": "passed",
+            "details": "Рекламные блоки на сайте не обнаружены",
+            "evidence": [],
+        }, []
+
+    if has_erid:
+        return {
+            "code": "advertising_marking", "title": "38-ФЗ — Маркировка рекламы (ERID)",
+            "status": "passed",
+            "details": "На сайте есть реклама и она промаркирована ERID-токеном",
+            "evidence": evidence,
+        }, []
+
+    return {
+        "code": "advertising_marking", "title": "38-ФЗ — Маркировка рекламы (ERID)",
+        "status": "failed",
+        "details": "На сайте есть реклама, но ERID-токен не найден",
+        "evidence": evidence,
+    }, [{
+        "code": "missing_erid", "title": "Реклама без ERID-токена",
+        "severity": "high", "category": "ads",
+        "description": (
+            "На сайте обнаружены метки «Реклама», но ERID-токен не найден. "
+            "Согласно ст. 18.1 ФЗ «О рекламе» (38-ФЗ), вся интернет-реклама с 1 сентября 2022 года должна "
+            "содержать ERID-токен и сведения о рекламодателе."
+        ),
+        "recommendation": (
+            "Зарегистрируйтесь в одном из ОРД (Яндекс, VK, ОРД-А, МедиаСкаут, Сбер ОРД, Первый ОРД), "
+            "получите ERID-токены для каждого рекламного материала и добавьте их в разметку."
+        ),
+        "evidence": evidence, "possible_fine": 500000,
+    }]
 
 
-# -- 17. Domain Zone Requirements --
+# ============================================================================
+# 8. 149-ФЗ — Реквизиты компании
+# ============================================================================
 
-def check_domain_requirements(final_url: str, pages_html: dict) -> Tuple[dict, list]:
-    parsed = urlparse(final_url)
-    domain = parsed.netloc.lower()
-    is_ru = domain.endswith(".ru") or domain.endswith(".ru.") or domain.endswith(".xn--p1ai")
+INN_PATTERN = re.compile(r"\bИНН\s*:?\s*\d{10,12}\b", re.IGNORECASE)
+OGRN_PATTERN = re.compile(r"\bОГРН(ИП)?\s*:?\s*\d{13,15}\b", re.IGNORECASE)
+KPP_PATTERN = re.compile(r"\bКПП\s*:?\s*\d{9}\b", re.IGNORECASE)
+ADDRESS_PATTERN = re.compile(
+    r"(юридическ[а-я]+ адрес|фактическ[а-я]+ адрес|почтов[а-я]+ адрес|"
+    r"место нахождения|г\.\s*[А-ЯЁ][а-яё]+|ул\.\s*[А-ЯЁ])",
+    re.IGNORECASE,
+)
+DIRECTOR_PATTERN = re.compile(
+    r"(генеральн[а-я]+ директор|директор|руководитель|управляющ[а-я]+|глава)\s*[:.]?\s*\S",
+    re.IGNORECASE,
+)
+COMPANY_FORM_PATTERN = re.compile(
+    r"\b(ООО|АО|ПАО|ОАО|ЗАО|ИП|самозанят)",
+    re.IGNORECASE,
+)
 
-    if not is_ru:
-        return {"code": "domain_requirements", "title": "Domain Zone Requirements",
-                "status": "passed", "details": "Not a .ru/.rf domain - no special requirements", "evidence": []}, []
 
+def check_company_requisites(pages_html: dict) -> Tuple[dict, list]:
+    found = {
+        "Форма организации (ООО/ИП/АО)": False,
+        "ИНН": False,
+        "ОГРН/ОГРНИП": False,
+        "Юридический/фактический адрес": False,
+        "Руководитель/директор": False,
+    }
+    evidence = []
+
+    for html in pages_html.values():
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text(" ", strip=True)
+
+        if not found["Форма организации (ООО/ИП/АО)"] and COMPANY_FORM_PATTERN.search(text):
+            found["Форма организации (ООО/ИП/АО)"] = True
+            evidence.append("Найдена форма организации (ООО/ИП/АО)")
+        if not found["ИНН"] and INN_PATTERN.search(text):
+            found["ИНН"] = True
+            evidence.append("ИНН найден")
+        if not found["ОГРН/ОГРНИП"] and OGRN_PATTERN.search(text):
+            found["ОГРН/ОГРНИП"] = True
+            evidence.append("ОГРН/ОГРНИП найден")
+        if not found["Юридический/фактический адрес"] and ADDRESS_PATTERN.search(text):
+            found["Юридический/фактический адрес"] = True
+            evidence.append("Адрес организации найден")
+        if not found["Руководитель/директор"] and DIRECTOR_PATTERN.search(text):
+            found["Руководитель/директор"] = True
+            evidence.append("Руководитель указан")
+
+    score = sum(found.values())
+    total = len(found)
+    missing = [k for k, v in found.items() if not v]
+
+    if score >= 4:
+        return {
+            "code": "company_requisites", "title": "149-ФЗ — Реквизиты компании",
+            "status": "passed",
+            "details": f"Указаны основные реквизиты ({score}/{total})" + (f". Не хватает: {', '.join(missing)}" if missing else ""),
+            "evidence": evidence,
+        }, []
+
+    if score >= 2:
+        return {
+            "code": "company_requisites", "title": "149-ФЗ — Реквизиты компании",
+            "status": "warning",
+            "details": f"Реквизиты указаны частично ({score}/{total}). Не хватает: {', '.join(missing)}",
+            "evidence": evidence,
+        }, [{
+            "code": "incomplete_requisites", "title": "Реквизиты компании указаны не полностью",
+            "severity": "medium", "category": "company_info",
+            "description": (
+                f"На сайте указано только {score} из {total} обязательных реквизитов. "
+                f"Не хватает: {', '.join(missing)}. Согласно ч. 2 ст. 10 ФЗ-149 владелец сайта обязан "
+                "разместить достоверную информацию о себе."
+            ),
+            "recommendation": "Добавьте на страницу «Контакты» или в футер: ИНН, ОГРН, юридический адрес, ФИО руководителя.",
+            "evidence": evidence, "possible_fine": 50000,
+        }]
+
+    if score >= 1:
+        return {
+            "code": "company_requisites", "title": "149-ФЗ — Реквизиты компании",
+            "status": "warning",
+            "details": f"Реквизиты практически отсутствуют ({score}/{total}). Не хватает: {', '.join(missing)}",
+            "evidence": evidence,
+        }, [{
+            "code": "minimal_requisites", "title": "Минимум информации о компании",
+            "severity": "high", "category": "company_info",
+            "description": (
+                f"Найдено только {score} из {total} обязательных реквизитов. "
+                f"Не хватает: {', '.join(missing)}. Это нарушение ч. 2 ст. 10 ФЗ-149."
+            ),
+            "recommendation": "Создайте отдельную страницу «Реквизиты» с полной информацией о юридическом лице или ИП.",
+            "evidence": evidence, "possible_fine": 100000,
+        }]
+
+    return {
+        "code": "company_requisites", "title": "149-ФЗ — Реквизиты компании",
+        "status": "failed",
+        "details": "Реквизиты компании на сайте не найдены",
+        "evidence": [],
+    }, [{
+        "code": "missing_requisites", "title": "Отсутствуют реквизиты компании",
+        "severity": "high", "category": "company_info",
+        "description": (
+            "На сайте не найдена информация о владельце: ни ИНН, ни ОГРН, ни юридический адрес, "
+            "ни данные руководителя. Это нарушение ч. 2 ст. 10 ФЗ-149 «Об информации»."
+        ),
+        "recommendation": "Создайте страницу «Реквизиты» и добавьте ссылку в футер.",
+        "evidence": [], "possible_fine": 100000,
+    }]
+
+
+# ============================================================================
+# 9. ЗоЗПП — Документы для потребителей
+# ============================================================================
+
+CONSUMER_DOCS = {
+    "Оферта/договор": ["оферта", "публичная оферта", "договор", "договор-оферта"],
+    "Возврат/обмен": ["возврат", "обмен товара", "возврата", "вернуть товар"],
+    "Доставка": ["доставка", "способы доставки", "условия доставки"],
+    "Оплата": ["оплата", "способы оплаты", "способ оплаты"],
+    "Гарантия": ["гарантия", "гарантийн", "срок гарантии"],
+}
+
+
+def check_consumer_rights(pages_html: dict, links: List[str]) -> Tuple[dict, list]:
     all_text = _all_text(pages_html)
-    owner_kw = ["site owner", "domain administrator", "site administrator",
-                "contact person", "responsible person"]
-    has_owner = any(kw in all_text for kw in owner_kw)
+    for link in links:
+        all_text += " " + link.lower()
 
-    if has_owner:
-        return {"code": "domain_requirements", "title": "Domain Zone Requirements (.ru/.rf)",
-                "status": "passed", "details": "Site owner info found", "evidence": ["Owner info present"]}, []
+    found = {}
+    evidence = []
+    for doc, keywords in CONSUMER_DOCS.items():
+        is_found = any(kw in all_text for kw in keywords)
+        found[doc] = is_found
+        if is_found:
+            evidence.append(f"Найдено: {doc}")
 
-    return {"code": "domain_requirements", "title": "Domain Zone Requirements (.ru/.rf)",
-            "status": "warning", "details": ".ru/.rf domain: site owner info not found on site. Required by domain registry rules.",
-            "evidence": []}, [{
-        "code": "no_domain_owner_info", "title": "Missing site owner info for .ru/.rf domain",
-        "severity": "low", "category": "company_info",
-        "description": ".ru and .rf domain registry rules require publishing administrator/owner contact information on the website.",
-        "recommendation": "Add site administrator contact info on the website.",
-        "evidence": [], "possible_fine": None}]
+    found_count = sum(found.values())
+    total = len(CONSUMER_DOCS)
+    missing = [k for k, v in found.items() if not v]
+
+    if found_count >= 4:
+        return {
+            "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
+            "status": "passed",
+            "details": f"Документы для потребителей найдены ({found_count}/{total})" + (f". Не хватает: {', '.join(missing)}" if missing else ""),
+            "evidence": evidence,
+        }, []
+
+    if found_count >= 2:
+        return {
+            "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
+            "status": "warning",
+            "details": f"Часть документов отсутствует ({found_count}/{total}). Не хватает: {', '.join(missing)}",
+            "evidence": evidence,
+        }, [{
+            "code": "missing_consumer_docs",
+            "title": f"Не хватает документов: {', '.join(missing)}",
+            "severity": "medium", "category": "consumer_rights",
+            "description": (
+                f"На сайте найдено только {found_count} из {total} обязательных для интернет-магазинов документов. "
+                f"Не хватает: {', '.join(missing)}. Это нарушение Закона «О защите прав потребителей»."
+            ),
+            "recommendation": f"Добавьте отдельные страницы: {', '.join(missing)}.",
+            "evidence": evidence, "possible_fine": 50000,
+        }]
+
+    return {
+        "code": "consumer_rights", "title": "ЗоЗПП — Документы для потребителей",
+        "status": "failed",
+        "details": f"Большинство потребительских документов отсутствует ({found_count}/{total}). Не хватает: {', '.join(missing)}",
+        "evidence": evidence,
+    }, [{
+        "code": "missing_consumer_docs_critical",
+        "title": "Критическое отсутствие документов для потребителей",
+        "severity": "high", "category": "consumer_rights",
+        "description": (
+            f"На сайте найдено только {found_count} из {total} обязательных документов: {', '.join(missing)} отсутствуют. "
+            "Для интернет-магазина это серьёзное нарушение ЗоЗПП."
+        ),
+        "recommendation": "Срочно разработайте и разместите все обязательные документы (оферта, возврат, доставка, оплата, гарантия).",
+        "evidence": evidence, "possible_fine": 100000,
+    }]
 
 
-# -- 18. Self-Employed / IP Marking --
+# ============================================================================
+# 10. 436-ФЗ — Возрастная маркировка
+# ============================================================================
 
-def check_self_employed_marking(pages_html: dict) -> Tuple[dict, list]:
+AGE_MARK_PATTERN = re.compile(r"\b(?:0\+|6\+|12\+|16\+|18\+)\b")
+ADULT_KW = [
+    "казино", "ставк", "букмекер", "алкогол", "табак", "вейп", "сигарет",
+    "эротик", "порно", "18+", "взрослый контент", "только для взрослых",
+]
+
+
+def check_age_marking(pages_html: dict) -> Tuple[dict, list]:
     all_text = _all_text(pages_html)
-    ip_kw = ["individual entrepreneur", "IE", "sole proprietor",
-             "self-employed", "professional income tax", "NPD"]
-    ogrnip_pat = re.compile(r"\bOGRNIP\s*:?\s*\d{15}\b", re.IGNORECASE)
+    all_html = _all_html(pages_html)
 
-    has_ip = any(kw in all_text for kw in ip_kw) or bool(ogrnip_pat.search(all_text))
+    has_adult = any(kw in all_text for kw in ADULT_KW)
+    age_marks = set(AGE_MARK_PATTERN.findall(all_html))
 
-    if not has_ip:
-        return {"code": "self_employed_marking", "title": "Self-Employed / IP Marking",
-                "status": "passed", "details": "No IE/self-employed indicators", "evidence": []}, []
+    if age_marks:
+        marks_str = ", ".join(sorted(age_marks))
+        if has_adult and "18+" not in age_marks:
+            return {
+                "code": "age_marking", "title": "436-ФЗ — Возрастная маркировка",
+                "status": "warning",
+                "details": f"Маркировка ({marks_str}) есть, но при контенте 18+ ожидается метка 18+",
+                "evidence": [f"Найденные метки: {marks_str}"],
+            }, [{
+                "code": "wrong_age_marking", "title": "Возрастная маркировка не соответствует контенту",
+                "severity": "medium", "category": "age_marking",
+                "description": "Найден контент категории 18+ (алкоголь/ставки/казино/прочее), но метка 18+ на сайте не выставлена.",
+                "recommendation": "Добавьте маркировку 18+ в шапку или футер сайта.",
+                "evidence": [f"Найденные метки: {marks_str}"], "possible_fine": 50000,
+            }]
+        return {
+            "code": "age_marking", "title": "436-ФЗ — Возрастная маркировка",
+            "status": "passed",
+            "details": f"Возрастная маркировка указана: {marks_str}",
+            "evidence": [f"Найденные метки: {marks_str}"],
+        }, []
 
-    has_full_name = re.compile(r"(IE|IP|individual entrepreneur)\s+[A-Z][a-z]+\s+[A-Z]", re.IGNORECASE).search(all_text)
-    has_ogrnip = bool(ogrnip_pat.search(all_text))
+    if has_adult:
+        return {
+            "code": "age_marking", "title": "436-ФЗ — Возрастная маркировка",
+            "status": "failed",
+            "details": "На сайте есть контент 18+, но возрастная маркировка отсутствует",
+            "evidence": [],
+        }, [{
+            "code": "missing_age_marking_adult", "title": "Контент 18+ без возрастной маркировки",
+            "severity": "high", "category": "age_marking",
+            "description": (
+                "Найден контент категории 18+ (алкоголь, ставки, табак, казино или подобное), "
+                "при этом метка возрастной категории на сайте не выставлена. Нарушение 436-ФЗ."
+            ),
+            "recommendation": "Добавьте маркировку 18+ в шапку или футер сайта.",
+            "evidence": [], "possible_fine": 50000,
+        }]
 
-    if has_full_name or has_ogrnip:
-        return {"code": "self_employed_marking", "title": "Self-Employed / IP Marking",
-                "status": "passed", "details": "IE details found", "evidence": ["IE info present"]}, []
+    return {
+        "code": "age_marking", "title": "436-ФЗ — Возрастная маркировка",
+        "status": "warning",
+        "details": "Возрастная маркировка не найдена. По 436-ФЗ рекомендуется указывать категорию (0+, 6+, 12+, 16+ или 18+)",
+        "evidence": [],
+    }, [{
+        "code": "missing_age_marking", "title": "Не указана возрастная маркировка",
+        "severity": "low", "category": "age_marking",
+        "description": (
+            "На сайте не найдена маркировка возрастной категории (0+, 6+, 12+, 16+ или 18+). "
+            "Согласно 436-ФЗ «О защите детей от информации, причиняющей вред их здоровью», маркировка рекомендуется для всех общедоступных сайтов."
+        ),
+        "recommendation": "Добавьте знак возрастной категории (например, 6+ или 16+) в футер сайта.",
+        "evidence": [], "possible_fine": 50000,
+    }]
 
-    return {"code": "self_employed_marking", "title": "Self-Employed / IP Marking",
-            "status": "warning", "details": "IE indicators found but details incomplete", "evidence": []}, [{
-        "code": "incomplete_ip_info", "title": "Incomplete IE/self-employed info",
-        "severity": "medium", "category": "company_info",
-        "description": "Individual entrepreneur or self-employed indicators found but full name and OGRNIP not provided. Required by consumer protection law.",
-        "recommendation": "Add full name of IE and OGRNIP number on the website.",
-        "evidence": [], "possible_fine": 30000}]
+
+# ============================================================================
+# 11. Контактная информация (доступность для пользователей)
+# ============================================================================
+
+PHONE_PATTERN = re.compile(r"(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
+EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+SCHEDULE_PATTERN = re.compile(
+    r"(режим работы|время работы|график|часы работы|пн[\-–]пт|круглосуточно|ежедневно)",
+    re.IGNORECASE,
+)
+MAP_PATTERN = re.compile(r"(yandex\.ru/maps|google\.com/maps|2gis|maps\.api)", re.IGNORECASE)
 
 
-# -- Robots & Sitemap --
+def check_contacts(pages_html: dict) -> Tuple[dict, list]:
+    found = {
+        "Телефон": False,
+        "Email": False,
+        "Режим работы": False,
+        "Карта": False,
+    }
+    evidence = []
+
+    for html in pages_html.values():
+        if not found["Телефон"] and PHONE_PATTERN.search(html):
+            found["Телефон"] = True
+            evidence.append("Телефон найден")
+        if not found["Email"] and EMAIL_PATTERN.search(html):
+            found["Email"] = True
+            evidence.append("Email найден")
+        if not found["Режим работы"] and SCHEDULE_PATTERN.search(html):
+            found["Режим работы"] = True
+            evidence.append("Режим работы указан")
+        if not found["Карта"] and MAP_PATTERN.search(html):
+            found["Карта"] = True
+            evidence.append("Карта (Яндекс/Google/2ГИС) найдена")
+
+    score = sum(found.values())
+    total = len(found)
+    missing = [k for k, v in found.items() if not v]
+
+    if score >= 3:
+        return {
+            "code": "contacts", "title": "Контактная информация",
+            "status": "passed",
+            "details": f"Контактные данные указаны ({score}/{total})" + (f". Не хватает: {', '.join(missing)}" if missing else ""),
+            "evidence": evidence,
+        }, []
+
+    if score >= 1:
+        return {
+            "code": "contacts", "title": "Контактная информация",
+            "status": "warning",
+            "details": f"Контакты указаны частично ({score}/{total}). Не хватает: {', '.join(missing)}",
+            "evidence": evidence,
+        }, [{
+            "code": "incomplete_contacts", "title": "Контактные данные указаны не полностью",
+            "severity": "medium", "category": "contacts",
+            "description": f"На сайте не найдено: {', '.join(missing)}. Это снижает доверие пользователей и затрудняет связь.",
+            "recommendation": "Создайте страницу «Контакты» с телефоном, email, адресом, режимом работы и картой проезда.",
+            "evidence": evidence, "possible_fine": 30000,
+        }]
+
+    return {
+        "code": "contacts", "title": "Контактная информация",
+        "status": "failed",
+        "details": "Контактная информация на сайте не найдена",
+        "evidence": [],
+    }, [{
+        "code": "missing_contacts", "title": "Нет контактной информации",
+        "severity": "high", "category": "contacts",
+        "description": "На сайте не найдены ни телефон, ни email, ни адрес. Серьёзное нарушение требований к информации для потребителей.",
+        "recommendation": "Добавьте страницу «Контакты» с телефоном, email и адресом.",
+        "evidence": [], "possible_fine": 50000,
+    }]
+
+
+# ============================================================================
+# 12. Безопасность платежей
+# ============================================================================
+
+PAYMENT_KW = [
+    "оплата картой", "оплатить", "корзина", "checkout", "касса",
+    "mastercard", "visa", "мир ", "юmoney", "юкасса", "yookassa",
+    "robokassa", "робокасса", "tinkoff", "сбербанк", "stripe", "paypal",
+]
+PAYMENT_SECURITY_KW = [
+    "безопасн", "ssl", "pci dss", "3-d secure", "3d secure",
+    "защищён", "шифрование", "https",
+]
+
+
+def check_payment_security(pages_html: dict) -> Tuple[dict, list]:
+    all_text = _all_text(pages_html)
+    has_payment = any(kw in all_text for kw in PAYMENT_KW)
+    has_security = any(kw in all_text for kw in PAYMENT_SECURITY_KW)
+
+    if not has_payment:
+        return {
+            "code": "payment_security", "title": "Безопасность платежей",
+            "status": "passed",
+            "details": "Формы приёма платежей не обнаружены",
+            "evidence": [],
+        }, []
+
+    if has_security:
+        return {
+            "code": "payment_security", "title": "Безопасность платежей",
+            "status": "passed",
+            "details": "На сайте принимаются платежи и есть информация об их безопасности",
+            "evidence": ["Найдено упоминание SSL/PCI DSS/3-D Secure/шифрования"],
+        }, []
+
+    return {
+        "code": "payment_security", "title": "Безопасность платежей",
+        "status": "warning",
+        "details": "На сайте принимаются платежи, но информации об их безопасности не найдено",
+        "evidence": [],
+    }, [{
+        "code": "no_payment_security_info", "title": "Нет информации о безопасности платежей",
+        "severity": "medium", "category": "payment_security",
+        "description": "Сайт принимает платежи, но не указано, как обеспечивается их безопасность (SSL, PCI DSS, 3-D Secure).",
+        "recommendation": "На странице оплаты или в FAQ укажите: используется SSL, поддержка 3-D Secure, соответствие PCI DSS платёжной системы.",
+        "evidence": [], "possible_fine": None,
+    }]
+
+
+# ============================================================================
+# 13. Технические проверки (title, meta, viewport, h1, OG, alt, robots, sitemap)
+# ============================================================================
+
+def check_technical(main_html: str, final_url: str, robots_ok: bool, sitemap_ok: bool) -> Tuple[List[dict], list]:
+    checks = []
+    issues = []
+    soup = BeautifulSoup(main_html, "lxml")
+
+    # title
+    title_tag = soup.find("title")
+    title_text = title_tag.get_text(strip=True) if title_tag else ""
+    title_len = len(title_text)
+    if title_len == 0:
+        checks.append({"code": "meta_title", "title": "Тег <title>", "status": "failed",
+                       "details": "Тег <title> отсутствует", "evidence": []})
+        issues.append({"code": "missing_title", "title": "Не задан тег <title>",
+                       "severity": "medium", "category": "technical",
+                       "description": "Тег <title> отсутствует. Это критично для SEO и отображения в браузере.",
+                       "recommendation": "Добавьте тег <title> с описанием содержимого страницы (30–60 символов).",
+                       "evidence": [], "possible_fine": None})
+    elif 10 <= title_len <= 120:
+        checks.append({"code": "meta_title", "title": "Тег <title>", "status": "passed",
+                       "details": f"Заголовок: «{title_text[:80]}» ({title_len} символов)", "evidence": []})
+    else:
+        checks.append({"code": "meta_title", "title": "Тег <title>", "status": "warning",
+                       "details": f"Заголовок длиной {title_len} символов (рекомендуется 30–60)", "evidence": []})
+        issues.append({"code": "bad_title_length", "title": "Длина <title> вне рекомендованного диапазона",
+                       "severity": "low", "category": "technical",
+                       "description": f"Длина <title>: {title_len} символов. Оптимум — 30–60.",
+                       "recommendation": "Сократите/расширьте <title> до 30–60 символов.",
+                       "evidence": [], "possible_fine": None})
+
+    # meta description
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    desc_content = (meta_desc.get("content", "").strip()) if meta_desc else ""
+    desc_len = len(desc_content)
+    if desc_len == 0:
+        checks.append({"code": "meta_description", "title": "Meta description", "status": "warning",
+                       "details": "Meta description не задан", "evidence": []})
+    elif 50 <= desc_len <= 300:
+        checks.append({"code": "meta_description", "title": "Meta description", "status": "passed",
+                       "details": f"Описание: {desc_len} символов", "evidence": []})
+    else:
+        checks.append({"code": "meta_description", "title": "Meta description", "status": "warning",
+                       "details": f"Описание длиной {desc_len} символов (рекомендуется 50–160)", "evidence": []})
+
+    # viewport
+    viewport = soup.find("meta", attrs={"name": "viewport"})
+    has_viewport = bool(viewport and viewport.get("content", ""))
+    checks.append({"code": "viewport", "title": "Mobile viewport",
+                   "status": "passed" if has_viewport else "warning",
+                   "details": "Тег viewport задан — сайт адаптирован под мобильные" if has_viewport
+                       else "Тег viewport не задан — возможны проблемы на мобильных",
+                   "evidence": []})
+
+    # favicon
+    favicon = soup.find("link", rel=lambda r: r and "icon" in r) or \
+              soup.find("link", href=lambda h: h and "favicon" in h)
+    checks.append({"code": "favicon", "title": "Favicon",
+                   "status": "passed" if favicon else "warning",
+                   "details": "Favicon найден" if favicon else "Favicon не найден",
+                   "evidence": []})
+
+    # charset
+    charset = soup.find("meta", attrs={"charset": True}) or \
+              soup.find("meta", attrs={"http-equiv": lambda v: v and "content-type" in v.lower()})
+    checks.append({"code": "charset", "title": "Кодировка",
+                   "status": "passed" if charset else "warning",
+                   "details": "Кодировка указана" if charset else "Кодировка не указана",
+                   "evidence": []})
+
+    # h1
+    h1_tags = soup.find_all("h1")
+    if len(h1_tags) == 1:
+        checks.append({"code": "h1", "title": "Заголовок <h1>", "status": "passed",
+                       "details": f"H1: «{h1_tags[0].get_text(strip=True)[:80]}»", "evidence": []})
+    elif len(h1_tags) > 1:
+        checks.append({"code": "h1", "title": "Заголовок <h1>", "status": "warning",
+                       "details": f"Найдено {len(h1_tags)} тегов <h1> — должен быть один",
+                       "evidence": []})
+    else:
+        checks.append({"code": "h1", "title": "Заголовок <h1>", "status": "warning",
+                       "details": "Тег <h1> отсутствует", "evidence": []})
+
+    # Open Graph
+    og_title = soup.find("meta", property="og:title")
+    og_desc = soup.find("meta", property="og:description")
+    og_image = soup.find("meta", property="og:image")
+    og_count = sum(1 for t in [og_title, og_desc, og_image] if t and t.get("content", "").strip())
+    if og_count >= 2:
+        checks.append({"code": "open_graph", "title": "Open Graph", "status": "passed",
+                       "details": f"OG-теги заданы ({og_count}/3)", "evidence": []})
+    elif og_count > 0:
+        checks.append({"code": "open_graph", "title": "Open Graph", "status": "warning",
+                       "details": f"OG-теги заданы частично ({og_count}/3)", "evidence": []})
+    else:
+        checks.append({"code": "open_graph", "title": "Open Graph", "status": "warning",
+                       "details": "OG-теги не заданы — нет красивого превью при шеринге", "evidence": []})
+
+    # alt у картинок
+    images = soup.find_all("img")
+    images_with_alt = sum(1 for img in images if img.get("alt"))
+    if not images:
+        checks.append({"code": "img_alt", "title": "Alt у изображений", "status": "passed",
+                       "details": "Изображений на странице нет", "evidence": []})
+    else:
+        ratio = images_with_alt / len(images)
+        if ratio >= 0.7:
+            checks.append({"code": "img_alt", "title": "Alt у изображений", "status": "passed",
+                           "details": f"Alt задан у {images_with_alt} из {len(images)} изображений",
+                           "evidence": []})
+        else:
+            checks.append({"code": "img_alt", "title": "Alt у изображений", "status": "warning",
+                           "details": f"Alt задан только у {images_with_alt} из {len(images)} изображений",
+                           "evidence": []})
+
+    # robots.txt
+    checks.append({"code": "robots_txt", "title": "robots.txt",
+                   "status": "passed" if robots_ok else "warning",
+                   "details": "Файл robots.txt доступен" if robots_ok else "Файл robots.txt недоступен или пуст",
+                   "evidence": []})
+
+    # sitemap.xml
+    checks.append({"code": "sitemap_xml", "title": "sitemap.xml",
+                   "status": "passed" if sitemap_ok else "warning",
+                   "details": "Файл sitemap.xml доступен" if sitemap_ok else "Файл sitemap.xml не найден",
+                   "evidence": []})
+
+    return checks, issues
+
+
+# ============================================================================
+# robots.txt + sitemap.xml
+# ============================================================================
 
 async def check_robots_sitemap(base_url: str, timeout: int = TIMEOUT) -> Tuple[bool, bool]:
     parsed = urlparse(base_url)
@@ -977,7 +1279,9 @@ async def check_robots_sitemap(base_url: str, timeout: int = TIMEOUT) -> Tuple[b
     return robots_ok, sitemap_ok
 
 
-# -- Score --
+# ============================================================================
+# Скоринг
+# ============================================================================
 
 def calculate_score(issues: list) -> Tuple[int, str]:
     score = 100
