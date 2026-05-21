@@ -51,6 +51,31 @@ async def run_full_scan(url: str, progress_callback=None) -> dict:
         final_url = normalized
         if not html:
             raise ConnectionError(f"Не удалось загрузить страницу: {normalized}")
+    else:
+        # Если страница похожа на SPA-заглушку (нет реального контента),
+        # пробуем перерендерить через Playwright
+        SPA_MARKERS = [
+            "не работает без javascript", "включите javascript",
+            "javascript должен быть включен", "javascript is required",
+            "you need to enable javascript", "please enable javascript",
+            "noscript",
+        ]
+        try:
+            from bs4 import BeautifulSoup as _BS
+            text_only = _BS(html, "lxml").get_text(" ", strip=True)
+        except Exception:
+            text_only = html
+        text_lower = text_only.lower()
+        is_spa = (
+            len(text_only) < 500
+            or any(m in text_lower for m in SPA_MARKERS)
+        )
+        if is_spa:
+            await update_progress(15, "Похоже на SPA, рендерим через Playwright")
+            pw_html = await fetch_page_playwright(normalized)
+            if pw_html and len(pw_html) > len(html):
+                html = pw_html
+                final_url = final_url or normalized
 
     await update_progress(20, "Главная страница загружена")
 
