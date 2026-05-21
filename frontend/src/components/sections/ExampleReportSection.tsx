@@ -1,12 +1,14 @@
 import Link from 'next/link'
 
 const exampleChecks = [
-  { title: 'HTTPS', status: 'passed' },
-  { title: 'Политика конфиденциальности', status: 'failed' },
+  { title: 'Политика обработки ПДн (152-ФЗ)', status: 'failed' },
   { title: 'Согласие в формах', status: 'failed' },
+  { title: 'Сервер в РФ (ст. 18.5)', status: 'passed' },
+  { title: 'Уведомление Роскомнадзора', status: 'warning' },
   { title: 'Cookie-баннер', status: 'warning' },
-  { title: 'Маркировка рекламы', status: 'passed' },
-  { title: 'Реквизиты компании', status: 'warning' },
+  { title: 'Маркировка рекламы (ERID)', status: 'passed' },
+  { title: 'Реквизиты компании (149-ФЗ)', status: 'warning' },
+  { title: 'Права потребителей (ЗоЗПП)', status: 'failed' },
 ]
 
 const statusConfig = {

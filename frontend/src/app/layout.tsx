@@ -4,7 +4,7 @@ import './globals.css'
 export const metadata: Metadata = {
   title: 'SiteGuard — Автоматическая проверка сайта',
   description:
-    'Бесплатная автоматическая проверка сайта на юридико-технические риски: политика конфиденциальности, cookie, реквизиты, HTTPS и многое другое.',
+    'Бесплатная автоматическая проверка сайта на соответствие требованиям РФ: 152-ФЗ, cookie-политика, маркировка рекламы, реквизиты, права потребителей.',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

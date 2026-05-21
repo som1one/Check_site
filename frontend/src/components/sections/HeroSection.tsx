@@ -22,8 +22,8 @@ export default function HeroSection() {
         </h1>
 
         <p className="text-lg sm:text-xl text-slate-300 mb-10 max-w-2xl mx-auto leading-relaxed">
-          Автоматический аудит: политика конфиденциальности, cookie-баннер, реквизиты компании,
-          HTTPS, маркировка рекламы и права потребителей.
+          Автоматический аудит: политика обработки персональных данных, cookie-баннер,
+          маркировка рекламы, локализация серверов, реквизиты и права потребителей.
         </p>
 
         <ScanForm />
@@ -33,7 +33,7 @@ export default function HeroSection() {
             <svg className="w-4 h-4 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
-            8 категорий проверок
+            8 ключевых проверок
           </div>
           <div className="flex items-center gap-2">
             <svg className="w-4 h-4 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">

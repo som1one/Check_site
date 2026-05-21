@@ -1,56 +1,43 @@
 const checks = [
   {
-    icon: '🔒',
-    title: 'HTTPS и безопасность',
-    desc: 'Проверяем наличие SSL-сертификата и защищённого соединения.',
-    category: 'technical',
-  },
-  {
-    icon: '📄',
-    title: 'Политика конфиденциальности',
-    desc: 'Ищем страницу с политикой обработки персональных данных (ФЗ-152).',
-    category: 'personal_data',
-  },
-  {
-    icon: '✅',
-    title: 'Согласие в формах',
-    desc: 'Проверяем наличие согласия на обработку данных рядом с формами.',
+    icon: '🛡️',
+    title: '152-ФЗ и персональные данные',
+    desc: 'Политика обработки ПДн, согласие в формах, уведомление Роскомнадзора.',
     category: 'personal_data',
   },
   {
     icon: '🍪',
-    title: 'Cookie-баннер',
-    desc: 'Ищем уведомление об использовании cookie-файлов.',
+    title: 'Cookie-политика',
+    desc: 'Наличие cookie-баннера с кнопками принятия и отказа.',
     category: 'cookies',
   },
   {
     icon: '📢',
     title: 'Маркировка рекламы',
-    desc: 'Проверяем наличие токена ERID в рекламных материалах (ФЗ-347).',
+    desc: 'ERID-токен и сведения о рекламодателе по 38-ФЗ.',
     category: 'ads',
+  },
+  {
+    icon: '🇷🇺',
+    title: 'Сервер в РФ',
+    desc: 'Локализация серверов с персональными данными граждан РФ (ст. 18.5).',
+    category: 'personal_data',
   },
   {
     icon: '🏢',
     title: 'Реквизиты компании',
-    desc: 'Ищем ИНН, ОГРН, адрес и контактные данные организации.',
+    desc: 'ИНН, ОГРН, юридический адрес и руководитель по 149-ФЗ.',
     category: 'company_info',
   },
   {
     icon: '🛒',
     title: 'Права потребителей',
-    desc: 'Проверяем наличие оферты, условий возврата, доставки и оплаты.',
+    desc: 'Оферта, возврат, доставка, оплата, гарантия по ЗоЗПП.',
     category: 'consumer_rights',
-  },
-  {
-    icon: '⚙️',
-    title: 'Технические параметры',
-    desc: 'Проверяем title, meta description, robots.txt и sitemap.xml.',
-    category: 'technical',
   },
 ]
 
 const categoryColors: Record<string, string> = {
-  technical: 'bg-slate-100 text-slate-600',
   personal_data: 'bg-blue-50 text-blue-600',
   cookies: 'bg-amber-50 text-amber-600',
   ads: 'bg-purple-50 text-purple-600',
@@ -65,11 +52,11 @@ export default function ChecksSection() {
         <div className="text-center mb-14">
           <h2 className="text-3xl sm:text-4xl font-bold text-slate-900 mb-4">Что проверяем</h2>
           <p className="text-lg text-slate-500 max-w-xl mx-auto">
-            8 категорий проверок по требованиям российского законодательства
+            Ключевые требования российского законодательства и Роскомнадзора
           </p>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {checks.map((check) => (
             <div key={check.title} className="card hover:shadow-card-hover transition-shadow">
               <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-xl mb-3 ${categoryColors[check.category]}`}>
